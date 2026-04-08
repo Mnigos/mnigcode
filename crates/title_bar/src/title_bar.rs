@@ -264,6 +264,12 @@ impl Render for TitleBar {
                 client::Status::SignedOut | client::Status::AuthenticationError
             );
 
+        let sidebar_top_bar_view = self
+            .multi_workspace
+            .as_ref()
+            .and_then(|mw| mw.upgrade())
+            .and_then(|mw| mw.read(cx).sidebar().and_then(|s| s.top_bar_view(cx)));
+
         children.push(
             h_flex()
                 .map(|this| {
@@ -275,6 +281,7 @@ impl Render for TitleBar {
                 })
                 .gap_1()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .children(sidebar_top_bar_view)
                 .children(self.render_call_controls(window, cx))
                 .children(self.render_connection_status(status, cx))
                 .child(self.update_version.clone())
