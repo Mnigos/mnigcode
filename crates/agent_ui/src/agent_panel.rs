@@ -11,7 +11,7 @@ use std::{
 use acp_thread::{AcpThread, AcpThreadEvent, MentionUri, ThreadStatus};
 use agent::{ContextServerRegistry, SharedThread, ThreadStore};
 use agent_client_protocol as acp;
-use agent_servers::AgentServer;
+use agent_servers::{AgentServer, CODEX_ID};
 use collections::HashSet;
 use db::kvp::{Dismissable, KeyValueStore};
 use itertools::Itertools;
@@ -122,6 +122,10 @@ fn read_global_last_used_agent(kvp: &KeyValueStore) -> Option<Agent> {
         .flatten()
         .and_then(|json| serde_json::from_str::<LastUsedAgent>(&json).log_err())
         .map(|entry| entry.agent)
+}
+
+fn is_codex_agent(agent: &Agent) -> bool {
+    matches!(agent, Agent::Custom { id } if id.as_ref() == CODEX_ID)
 }
 
 async fn write_global_last_used_agent(kvp: KeyValueStore, agent: Agent) {
@@ -860,29 +864,34 @@ impl AgentPanel {
                 .as_ref()
                 .and_then(|p| p.last_active_thread.as_ref())
             {
-                match &thread_info.session_id {
-                    Some(session_id_str) => {
-                        let session_id = acp::SessionId::new(session_id_str.clone());
-                        let is_restorable = cx
-                            .update(|_window, cx| {
-                                let store = ThreadMetadataStore::global(cx);
-                                store
-                                    .read(cx)
-                                    .entry_by_session(&session_id)
-                                    .is_some_and(|entry| !entry.archived)
-                            })
-                            .unwrap_or(false);
-                        if is_restorable {
-                            Some(thread_info)
-                        } else {
-                            log::info!(
-                                "last active thread {} is archived or missing, skipping restoration",
-                                session_id_str
-                            );
-                            None
+                if is_codex_agent(&thread_info.agent_type) {
+                    log::info!("skipping automatic Codex ACP thread restoration");
+                    None
+                } else {
+                    match &thread_info.session_id {
+                        Some(session_id_str) => {
+                            let session_id = acp::SessionId::new(session_id_str.clone());
+                            let is_restorable = cx
+                                .update(|_window, cx| {
+                                    let store = ThreadMetadataStore::global(cx);
+                                    store
+                                        .read(cx)
+                                        .entry_by_session(&session_id)
+                                        .is_some_and(|entry| !entry.archived)
+                                })
+                                .unwrap_or(false);
+                            if is_restorable {
+                                Some(thread_info)
+                            } else {
+                                log::info!(
+                                    "last active thread {} is archived or missing, skipping restoration",
+                                    session_id_str
+                                );
+                                None
+                            }
                         }
+                        None => None,
                     }
-                    None => None,
                 }
             } else {
                 None
@@ -3752,7 +3761,7 @@ impl Panel for AgentPanel {
     }
 
     fn set_active(&mut self, active: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if active {
+        if active && !is_codex_agent(&self.selected_agent) {
             self.ensure_thread_initialized(window, cx);
         }
     }
