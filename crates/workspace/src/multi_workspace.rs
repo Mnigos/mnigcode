@@ -2,9 +2,9 @@ use anyhow::Result;
 use fs::Fs;
 
 use gpui::{
-    AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    ManagedView, MouseButton, Pixels, Render, Subscription, Task, Tiling, Window, WindowId,
-    actions, deferred, px,
+    AnyElement, AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle,
+    Focusable, ManagedView, MouseButton, Pixels, Render, Subscription, Task, Tiling, Window,
+    WindowId, actions, deferred, px,
 };
 pub use project::ProjectGroupKey;
 use project::{DisableAiSettings, Project};
@@ -122,6 +122,13 @@ pub trait Sidebar: Focusable + Render + EventEmitter<SidebarEvent> + Sized {
     fn is_threads_list_view_active(&self) -> bool {
         true
     }
+
+    /// An optional view rendered as a floating overlay in the top-right corner of the
+    /// center surface. Used by the product shell to host controls (such as the
+    /// editor/agents mode switcher) that should remain visible across all modes.
+    fn top_bar_view(&self, _cx: &App) -> Option<AnyView> {
+        None
+    }
     /// Makes focus reset back to the search editor upon toggling the sidebar from outside
     fn prepare_for_focus(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
     /// Opens or cycles the thread switcher popup.
@@ -162,6 +169,7 @@ pub trait SidebarHandle: 'static + Send + Sync {
     fn prepare_for_focus(&self, window: &mut Window, cx: &mut App);
     fn has_notifications(&self, cx: &App) -> bool;
     fn to_any(&self) -> AnyView;
+    fn top_bar_view(&self, cx: &App) -> Option<AnyView>;
     fn entity_id(&self) -> EntityId;
     fn toggle_thread_switcher(&self, select_last: bool, window: &mut Window, cx: &mut App);
     fn cycle_project(&self, forward: bool, window: &mut Window, cx: &mut App);
@@ -211,6 +219,10 @@ impl<T: Sidebar> SidebarHandle for Entity<T> {
 
     fn to_any(&self) -> AnyView {
         self.clone().into()
+    }
+
+    fn top_bar_view(&self, cx: &App) -> Option<AnyView> {
+        self.read(cx).top_bar_view(cx)
     }
 
     fn entity_id(&self) -> EntityId {
@@ -289,6 +301,10 @@ pub struct MultiWorkspace {
     sidebar: Option<Box<dyn SidebarHandle>>,
     sidebar_open: bool,
     sidebar_overlay: Option<AnyView>,
+    center_surface: Option<AnyView>,
+    /// Sidebar state restored from disk before any sidebar was registered.
+    /// Applied to the sidebar in `register_sidebar` once it becomes available.
+    pending_sidebar_state: Option<String>,
     pending_removal_tasks: Vec<Task<()>>,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -343,6 +359,8 @@ impl MultiWorkspace {
             sidebar: None,
             sidebar_open: false,
             sidebar_overlay: None,
+            center_surface: None,
+            pending_sidebar_state: None,
             pending_removal_tasks: Vec::new(),
             _serialize_task: None,
             _subscriptions: vec![
@@ -368,12 +386,50 @@ impl MultiWorkspace {
         self.sidebar = Some(Box::new(sidebar));
     }
 
+    /// Restore the sidebar's serialized state if a sidebar is already
+    /// registered, otherwise stash it so the next `register_sidebar` call can
+    /// apply it. Used by `restore_multiworkspace` which can fire before
+    /// downstream code has had a chance to register the sidebar.
+    pub fn restore_sidebar_state(
+        &mut self,
+        state: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(handle) = self.sidebar.as_ref() {
+            handle.restore_serialized_state(&state, window, cx);
+        } else {
+            self.pending_sidebar_state = Some(state);
+        }
+    }
+
+    /// Apply any sidebar state that was queued up before the sidebar was
+    /// registered. Should be called after `register_sidebar` once a `Window`
+    /// is available.
+    pub fn apply_pending_sidebar_state(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(state) = self.pending_sidebar_state.take() else {
+            return;
+        };
+        if let Some(handle) = self.sidebar.as_ref() {
+            handle.restore_serialized_state(&state, window, cx);
+        }
+    }
+
     pub fn sidebar(&self) -> Option<&dyn SidebarHandle> {
         self.sidebar.as_deref()
     }
 
     pub fn set_sidebar_overlay(&mut self, overlay: Option<AnyView>, cx: &mut Context<Self>) {
         self.sidebar_overlay = overlay;
+        cx.notify();
+    }
+
+    pub fn set_center_surface(&mut self, surface: Option<AnyView>, cx: &mut Context<Self>) {
+        self.center_surface = surface;
         cx.notify();
     }
 
@@ -1796,6 +1852,11 @@ impl Render for MultiWorkspace {
         let workspace = self.workspace().clone();
         let workspace_key_context = workspace.update(cx, |workspace, cx| workspace.key_context(cx));
         let root = workspace.update(cx, |workspace, cx| workspace.actions(h_flex(), window, cx));
+        let center_surface: AnyElement = self
+            .center_surface
+            .as_ref()
+            .map(|surface| surface.clone().into_any_element())
+            .unwrap_or_else(|| self.workspace().clone().into_any_element());
 
         client_side_decorations(
             root.key_context(workspace_key_context)
@@ -1889,7 +1950,7 @@ impl Render for MultiWorkspace {
                         .flex_1()
                         .size_full()
                         .overflow_hidden()
-                        .child(self.workspace().clone()),
+                        .child(center_surface),
                 )
                 .children(right_sidebar)
                 .child(self.workspace().read(cx).modal_layer.clone())
