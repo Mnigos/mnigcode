@@ -13491,6 +13491,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "projects_sidebar"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "editor",
+ "futures 0.3.32",
+ "gpui",
+ "language",
+ "log",
+ "menu",
+ "serde",
+ "serde_json",
+ "smol",
+ "ui",
+ "workspace",
+]
+
+[[package]]
 name = "prometheus"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -22303,6 +22321,7 @@ dependencies = [
  "project",
  "project_panel",
  "project_symbols",
+ "projects_sidebar",
  "prompt_store",
  "proto",
  "rayon",
