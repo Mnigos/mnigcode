@@ -66,6 +66,16 @@ impl ProjectsSidebar {
         )
         .detach();
 
+        // Serialize thread state whenever agents_surface changes (turn
+        // finishes, user stops, new thread created). The observe fires on
+        // every cx.notify() from agents_surface; the serialize call is async
+        // and deduplicates via a single in-flight task so rapid fires are
+        // cheap.
+        cx.observe(&agents_surface, |_this, _, cx| {
+            cx.emit(SidebarEvent::SerializeNeeded);
+        })
+        .detach();
+
         let workspaces = multi_workspace
             .read(cx)
             .workspaces()
