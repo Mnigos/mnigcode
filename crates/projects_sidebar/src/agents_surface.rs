@@ -37,14 +37,13 @@ use crate::transcript::{
 const CODEX_COMPOSER_WIDTH: Pixels = px(720.0);
 
 const AVAILABLE_MODELS: &[(&str, &str)] = &[
-    ("o4-mini", "o4-mini"),
-    ("o3", "o3"),
-    ("gpt-4.1", "GPT-4.1"),
-    ("gpt-4.1-mini", "GPT-4.1 Mini"),
-    ("gpt-4.1-nano", "GPT-4.1 Nano"),
+    ("gpt-5.4", "GPT-5.4"),
+    ("gpt-5.4-mini", "GPT-5.4-Mini"),
+    ("gpt-5.3-codex", "GPT-5.3-Codex"),
+    ("gpt-5.2", "GPT-5.2"),
 ];
 
-const DEFAULT_MODEL: &str = "o4-mini";
+const DEFAULT_MODEL: &str = "gpt-5.4";
 
 const REASONING_EFFORTS: &[(&str, &str)] = &[
     ("low", "Low"),
