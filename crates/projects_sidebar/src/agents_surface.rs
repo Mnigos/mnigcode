@@ -1,8 +1,8 @@
 use editor::Editor;
 use gpui::{
     AnyElement, App, Context, Entity, ExternalPaths, Focusable, MouseButton, ObjectFit,
-    PathPromptOptions, Pixels, Render, ScrollHandle, SharedString, Subscription, Window, deferred,
-    img, px,
+    PathPromptOptions, Pixels, Render, ScrollHandle, SharedString, Subscription, Task, Window,
+    deferred, img, px,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use language::language_settings::SoftWrap;
@@ -12,7 +12,9 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
 };
-use ui::{CommonAnimationExt, ContextMenu, PopoverMenu, Tooltip, WithScrollbar, prelude::*};
+use ui::{
+    CommonAnimationExt, ContextMenu, PopoverMenu, TintColor, Tooltip, WithScrollbar, prelude::*,
+};
 use workspace::{MultiWorkspace, MultiWorkspaceEvent};
 
 use crate::CODEX_COMPOSER_KEY_CONTEXT;
@@ -63,6 +65,7 @@ pub struct AgentsSurface {
     previewing_attachment: Option<PathBuf>,
     selected_model: String,
     selected_reasoning_effort: String,
+    running_turn_tasks: Vec<Task<()>>,
     expanded_tool_messages: HashSet<(SharedString, usize)>,
     markdown_cache: HashMap<(SharedString, usize), Entity<Markdown>>,
     transcript_scroll_handle: ScrollHandle,
@@ -110,6 +113,7 @@ impl AgentsSurface {
             previewing_attachment: None,
             selected_model: DEFAULT_MODEL.to_string(),
             selected_reasoning_effort: DEFAULT_REASONING_EFFORT.to_string(),
+            running_turn_tasks: Vec::new(),
             expanded_tool_messages: HashSet::new(),
             markdown_cache: HashMap::new(),
             transcript_scroll_handle: ScrollHandle::new(),
@@ -272,6 +276,34 @@ impl AgentsSurface {
         self.submit_composer(window, cx);
     }
 
+    fn is_turn_running(&self, cx: &App) -> bool {
+        self.active_thread(cx)
+            .is_some_and(|thread| thread.run_status.is_active())
+    }
+
+    fn stop_active_turn(&mut self, cx: &mut Context<Self>) {
+        // Dropping the tasks kills the codex child process (kill_on_drop)
+        // and stops the receiver loop.
+        self.running_turn_tasks.clear();
+
+        // Mark the active thread as idle and any running tool calls as failed.
+        if let Some(workspace_path) = workspace_storage_key(&self.workspace, cx) {
+            if let Some(thread_id) = self.active_thread_by_path.get(&workspace_path).cloned() {
+                if let Some(thread) = self.thread_mut(&thread_id) {
+                    thread.run_status = HarnessRunStatus::Idle;
+                    for message in thread.messages.iter_mut() {
+                        if let TranscriptRole::Tool { status, .. } = &mut message.role {
+                            if *status == ToolStatus::Running {
+                                *status = ToolStatus::Completed;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
     fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let has_attachments = !self.pending_attachments.is_empty();
 
@@ -307,9 +339,9 @@ impl AgentsSurface {
         };
 
         let (updates_sender, updates_receiver) = channel::unbounded();
-        cx.background_spawn(run_codex_app_server_turn(request, updates_sender))
-            .detach();
-        cx.spawn(async move |this, cx| {
+        let bg_task =
+            cx.background_spawn(run_codex_app_server_turn(request, updates_sender));
+        let fg_task = cx.spawn(async move |this, cx| {
             while let Ok(update) = updates_receiver.recv().await {
                 if let Err(error) = this.update(cx, |this, cx| {
                     this.apply_turn_update(update, cx);
@@ -318,8 +350,9 @@ impl AgentsSurface {
                     break;
                 }
             }
-        })
-        .detach();
+        });
+        self.running_turn_tasks.push(bg_task);
+        self.running_turn_tasks.push(fg_task);
 
         cx.notify();
     }
@@ -1200,6 +1233,7 @@ impl AgentsSurface {
     }
 
     fn render_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_running = self.is_turn_running(cx);
         let attachments_element = if self.pending_attachments.is_empty() {
             None
         } else {
@@ -1269,15 +1303,25 @@ impl AgentsSurface {
                             .style(ButtonStyle::Subtle)
                             .tooltip(Tooltip::text("Voice input")),
                     )
-                    .child(
+                    .child(if is_running {
+                        IconButton::new("codex-composer-stop", IconName::Stop)
+                            .icon_size(IconSize::Small)
+                            .style(ButtonStyle::Tinted(TintColor::Error))
+                            .tooltip(Tooltip::text("Stop generation"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.stop_active_turn(cx);
+                            }))
+                            .into_any_element()
+                    } else {
                         IconButton::new("codex-composer-send", IconName::ArrowUp)
                             .icon_size(IconSize::Small)
                             .style(ButtonStyle::Filled)
                             .tooltip(Tooltip::text("Send message"))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.submit_composer(window, cx);
-                            })),
-                    ),
+                            }))
+                            .into_any_element()
+                    }),
             )
     }
 
