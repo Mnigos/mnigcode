@@ -628,25 +628,19 @@ fn extract_tool_detail(
             .map(str::to_string)
     };
 
-    // Prefer command-specific details first for command tools so we capture
-    // both the invocation and any stdout.
+    // For commands, only put stdout/output in the detail — the command itself
+    // lives in the title ("Run command: ...") and the renderer extracts it
+    // from there, so duplicating it here causes the "$ cmd" line to appear
+    // twice.
     if matches!(kind, HarnessToolKind::Command) {
-        let mut pieces: Vec<String> = Vec::new();
-        let command = command_string(params, item_payload);
-        if let Some(cmd) = command.as_ref() {
-            pieces.push(format!("$ {cmd}"));
-        }
         if let Some(output) = lookup("output")
             .or_else(|| lookup("stdout"))
             .or_else(|| lookup("text"))
+            .or_else(|| lookup("delta"))
         {
-            pieces.push(output);
-        } else if let Some(delta) = lookup("delta") {
-            pieces.push(delta);
+            return output.into();
         }
-        if !pieces.is_empty() {
-            return pieces.join("\n").into();
-        }
+        return SharedString::default();
     }
 
     // Generic file/search/other extraction.

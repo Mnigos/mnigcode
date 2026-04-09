@@ -809,6 +809,7 @@ impl AgentsSurface {
                 *status,
                 title,
                 &message.text,
+                window,
                 cx,
             );
         }
@@ -870,13 +871,14 @@ impl AgentsSurface {
     }
 
     fn render_tool_message(
-        &self,
+        &mut self,
         thread_id: SharedString,
         index: usize,
         kind: ToolDisplayKind,
         status: ToolStatus,
         title: &SharedString,
         body: &str,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_reasoning = matches!(kind, ToolDisplayKind::Reasoning);
@@ -988,7 +990,26 @@ impl AgentsSurface {
         if expanded {
             let body_element: AnyElement = if has_body {
                 if matches!(kind, ToolDisplayKind::Command) {
-                    self.render_command_body(body, status, cx)
+                    self.render_command_body(title, body, status, cx)
+                } else if is_reasoning {
+                    let source: SharedString = body.to_string().into();
+                    let cache_key = (key.0.clone(), key.1);
+                    let md_entity = self
+                        .markdown_cache
+                        .entry(cache_key)
+                        .or_insert_with(|| {
+                            cx.new(|cx| Markdown::new(source.clone(), None, None, cx))
+                        })
+                        .clone();
+                    md_entity.update(cx, |md, cx| {
+                        md.reset(source, cx);
+                    });
+                    let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                    div()
+                        .ml(px(20.0))
+                        .text_color(Color::Muted.color(cx))
+                        .child(MarkdownElement::new(md_entity, style))
+                        .into_any_element()
                 } else if kind.body_is_monospace() {
                     div()
                         .ml(px(20.0))
@@ -1043,36 +1064,24 @@ impl AgentsSurface {
 
     fn render_command_body(
         &self,
+        title: &SharedString,
         body: &str,
         status: ToolStatus,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
-        // The harness formats command details as `$ {cmd}\n{stdout}`. Split on
-        // the first line so we can render the shell prompt and the output as
-        // separate blocks.
-        let mut lines = body.splitn(2, '\n');
-        let first_line = lines.next().unwrap_or("");
-        let remainder = lines.next().unwrap_or("");
-
-        let (command_text, output_text): (SharedString, Option<SharedString>) =
-            if let Some(stripped) = first_line.strip_prefix("$ ") {
-                let command: SharedString = stripped.to_string().into();
-                let output = if remainder.trim().is_empty() {
-                    None
-                } else {
-                    Some(SharedString::from(remainder.to_string()))
-                };
-                (command, output)
-            } else {
-                (first_line.to_string().into(), {
-                    if remainder.trim().is_empty() {
-                        None
-                    } else {
-                        Some(SharedString::from(remainder.to_string()))
-                    }
-                })
-            };
+        // The command string lives in the title ("Run command: {cmd}").
+        // The body contains only stdout/output.
+        let command_text: SharedString = title
+            .split_once(": ")
+            .map(|(_, cmd)| cmd.to_string())
+            .unwrap_or_default()
+            .into();
+        let output_text: Option<SharedString> = if body.trim().is_empty() {
+            None
+        } else {
+            Some(SharedString::from(body.to_string()))
+        };
 
         let mut card = v_flex()
             .ml(px(20.0))
