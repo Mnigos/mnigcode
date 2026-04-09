@@ -510,7 +510,10 @@ fn parse_tool_event(method: &str, params: Option<&Value>) -> Option<ParsedToolEv
     // *should* drop so we don't double-render assistant text as a tool block.
     let item_payload = params.and_then(|params| params.get("item"));
     let item_type = item_payload.and_then(|item| item.get("type")).and_then(Value::as_str);
-    if item_type == Some("agentMessage") || item_type == Some("agent_message") {
+    if matches!(
+        item_type,
+        Some("agentMessage" | "agent_message" | "userMessage" | "user_message")
+    ) {
         return None;
     }
 
@@ -631,14 +634,22 @@ fn extract_tool_detail(
     // For commands, only put stdout/output in the detail — the command itself
     // lives in the title ("Run command: ...") and the renderer extracts it
     // from there, so duplicating it here causes the "$ cmd" line to appear
-    // twice.
+    // twice. On "completed" events the server re-sends the full item with
+    // the command in "output" — skip that to avoid triple-rendering.
     if matches!(kind, HarnessToolKind::Command) {
+        if matches!(
+            phase_str,
+            "completed" | "end" | "ended" | "complete" | "finished"
+        ) {
+            return SharedString::default();
+        }
         if let Some(output) = lookup("output")
             .or_else(|| lookup("stdout"))
-            .or_else(|| lookup("text"))
-            .or_else(|| lookup("delta"))
         {
             return output.into();
+        }
+        if let Some(delta) = lookup("delta") {
+            return delta.into();
         }
         return SharedString::default();
     }
