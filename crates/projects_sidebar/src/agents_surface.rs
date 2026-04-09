@@ -12,7 +12,7 @@ use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
 };
-use ui::{CommonAnimationExt, Tooltip, WithScrollbar, prelude::*};
+use ui::{CommonAnimationExt, ContextMenu, PopoverMenu, Tooltip, WithScrollbar, prelude::*};
 use workspace::{MultiWorkspace, MultiWorkspaceEvent};
 
 use crate::CODEX_COMPOSER_KEY_CONTEXT;
@@ -36,6 +36,24 @@ use crate::transcript::{
 
 const CODEX_COMPOSER_WIDTH: Pixels = px(720.0);
 
+const AVAILABLE_MODELS: &[(&str, &str)] = &[
+    ("o4-mini", "o4-mini"),
+    ("o3", "o3"),
+    ("gpt-4.1", "GPT-4.1"),
+    ("gpt-4.1-mini", "GPT-4.1 Mini"),
+    ("gpt-4.1-nano", "GPT-4.1 Nano"),
+];
+
+const DEFAULT_MODEL: &str = "o4-mini";
+
+const REASONING_EFFORTS: &[(&str, &str)] = &[
+    ("low", "Low"),
+    ("medium", "Medium"),
+    ("high", "High"),
+];
+
+const DEFAULT_REASONING_EFFORT: &str = "high";
+
 pub struct AgentsSurface {
     workspace: Entity<workspace::Workspace>,
     composer_editor: Entity<Editor>,
@@ -44,6 +62,8 @@ pub struct AgentsSurface {
     next_thread_number: usize,
     pending_attachments: Vec<PathBuf>,
     previewing_attachment: Option<PathBuf>,
+    selected_model: String,
+    selected_reasoning_effort: String,
     expanded_tool_messages: HashSet<(SharedString, usize)>,
     markdown_cache: HashMap<(SharedString, usize), Entity<Markdown>>,
     transcript_scroll_handle: ScrollHandle,
@@ -89,6 +109,8 @@ impl AgentsSurface {
             next_thread_number: 1,
             pending_attachments: Vec::new(),
             previewing_attachment: None,
+            selected_model: DEFAULT_MODEL.to_string(),
+            selected_reasoning_effort: DEFAULT_REASONING_EFFORT.to_string(),
             expanded_tool_messages: HashSet::new(),
             markdown_cache: HashMap::new(),
             transcript_scroll_handle: ScrollHandle::new(),
@@ -347,8 +369,8 @@ impl AgentsSurface {
             provider_thread_id: thread.provider_thread_id.clone(),
             cwd: thread.cwd.clone(),
             input: text,
-            model: "gpt-5.4".to_string(),
-            reasoning_effort: "high".to_string(),
+            model: self.selected_model.clone(),
+            reasoning_effort: self.selected_reasoning_effort.clone(),
             approval_policy: HarnessApprovalPolicy::Never,
             sandbox_policy: HarnessSandboxPolicy::DangerFullAccess,
         })
@@ -642,6 +664,22 @@ impl AgentsSurface {
         if value > self.next_thread_number {
             self.next_thread_number = value;
         }
+    }
+
+    pub(crate) fn selected_model(&self) -> &str {
+        &self.selected_model
+    }
+
+    pub(crate) fn set_selected_model(&mut self, model: String) {
+        self.selected_model = model;
+    }
+
+    pub(crate) fn selected_reasoning_effort(&self) -> &str {
+        &self.selected_reasoning_effort
+    }
+
+    pub(crate) fn set_selected_reasoning_effort(&mut self, effort: String) {
+        self.selected_reasoning_effort = effort;
     }
 }
 
@@ -1214,18 +1252,8 @@ impl AgentsSurface {
                                 this.pick_attachments(window, cx);
                             })),
                     )
-                    .child(
-                        Button::new("codex-composer-model", "GPT-5.4")
-                            .label_size(LabelSize::Small)
-                            .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
-                            .style(ButtonStyle::Subtle),
-                    )
-                    .child(
-                        Button::new("codex-composer-reasoning", "High")
-                            .label_size(LabelSize::Small)
-                            .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
-                            .style(ButtonStyle::Subtle),
-                    )
+                    .child(self.render_model_selector(cx))
+                    .child(self.render_reasoning_selector(cx))
                     .child(div().flex_1())
                     .child(
                         IconButton::new("codex-composer-mic", IconName::Mic)
@@ -1439,6 +1467,96 @@ impl AgentsSurface {
             .with_priority(2)
             .into_any_element(),
         )
+    }
+
+    fn render_model_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current_label: SharedString = AVAILABLE_MODELS
+            .iter()
+            .find(|(id, _)| *id == self.selected_model)
+            .map(|(_, label)| label.to_string())
+            .unwrap_or_else(|| self.selected_model.clone())
+            .into();
+
+        let this = cx.entity().downgrade();
+        PopoverMenu::new("codex-model-selector")
+            .anchor(gpui::Corner::TopLeft)
+            .trigger(
+                Button::new("codex-composer-model", current_label)
+                    .label_size(LabelSize::Small)
+                    .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                    .style(ButtonStyle::Subtle),
+            )
+            .menu(move |window, cx| {
+                let this = this.clone();
+                let current = this.upgrade()?.read(cx).selected_model.clone();
+                Some(ContextMenu::build(window, cx, |mut menu, _window, _cx| {
+                    for &(model_id, label) in AVAILABLE_MODELS {
+                        let this = this.clone();
+                        let model_id = model_id.to_string();
+                        let is_selected = current == model_id;
+                        menu = menu.toggleable_entry(
+                            label,
+                            is_selected,
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                if let Some(this) = this.upgrade() {
+                                    this.update(cx, |this, cx| {
+                                        this.selected_model = model_id.clone();
+                                        cx.notify();
+                                    });
+                                }
+                            },
+                        );
+                    }
+                    menu
+                }))
+            })
+    }
+
+    fn render_reasoning_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let current_label: SharedString = REASONING_EFFORTS
+            .iter()
+            .find(|(id, _)| *id == self.selected_reasoning_effort)
+            .map(|(_, label)| label.to_string())
+            .unwrap_or_else(|| self.selected_reasoning_effort.clone())
+            .into();
+
+        let this = cx.entity().downgrade();
+        PopoverMenu::new("codex-reasoning-selector")
+            .anchor(gpui::Corner::TopLeft)
+            .trigger(
+                Button::new("codex-composer-reasoning", current_label)
+                    .label_size(LabelSize::Small)
+                    .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                    .style(ButtonStyle::Subtle),
+            )
+            .menu(move |window, cx| {
+                let this = this.clone();
+                let current = this.upgrade()?.read(cx).selected_reasoning_effort.clone();
+                Some(ContextMenu::build(window, cx, |mut menu, _window, _cx| {
+                    for &(effort_id, label) in REASONING_EFFORTS {
+                        let this = this.clone();
+                        let effort_id = effort_id.to_string();
+                        let is_selected = current == effort_id;
+                        menu = menu.toggleable_entry(
+                            label,
+                            is_selected,
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                if let Some(this) = this.upgrade() {
+                                    this.update(cx, |this, cx| {
+                                        this.selected_reasoning_effort = effort_id.clone();
+                                        cx.notify();
+                                    });
+                                }
+                            },
+                        );
+                    }
+                    menu
+                }))
+            })
     }
 
     fn render_run_controls(&self, _cx: &mut Context<Self>) -> impl IntoElement {

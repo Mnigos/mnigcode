@@ -11,6 +11,10 @@ pub(crate) struct SerializedProjectsSidebar {
     pub(crate) thread_groups: Vec<SerializedThreadGroup>,
     #[serde(default)]
     pub(crate) next_thread_number: usize,
+    #[serde(default)]
+    pub(crate) selected_model: Option<String>,
+    #[serde(default)]
+    pub(crate) selected_reasoning_effort: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]

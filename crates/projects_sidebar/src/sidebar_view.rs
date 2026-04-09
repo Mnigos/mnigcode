@@ -528,6 +528,10 @@ impl workspace::Sidebar for ProjectsSidebar {
             mode: self.mode,
             thread_groups: agents_surface.serialize_threads(),
             next_thread_number: agents_surface.next_thread_number(),
+            selected_model: Some(agents_surface.selected_model().to_string()),
+            selected_reasoning_effort: Some(
+                agents_surface.selected_reasoning_effort().to_string(),
+            ),
         };
         serde_json::to_string(&serialized).ok()
     }
@@ -544,11 +548,19 @@ impl workspace::Sidebar for ProjectsSidebar {
                     mode,
                     thread_groups,
                     next_thread_number,
+                    selected_model,
+                    selected_reasoning_effort,
                 } = serialized;
                 self.mode = mode;
                 self.agents_surface.update(cx, |agents_surface, _| {
                     agents_surface.restore_threads(thread_groups);
                     agents_surface.set_next_thread_number(next_thread_number);
+                    if let Some(model) = selected_model {
+                        agents_surface.set_selected_model(model);
+                    }
+                    if let Some(effort) = selected_reasoning_effort {
+                        agents_surface.set_selected_reasoning_effort(effort);
+                    }
                 });
                 cx.defer_in(window, move |this, window, cx| {
                     this.set_mode(mode, window, cx);
