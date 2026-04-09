@@ -940,10 +940,7 @@ impl AgentsSurface {
         let expanded = self.expanded_tool_messages.contains(&key);
         let has_body = !body.trim().is_empty();
         let is_running = status == ToolStatus::Running;
-        // While the tool is running we always allow expanding so the user can
-        // watch streaming output as it arrives. After it finishes we only show
-        // the chevron when there's actually something to look at.
-        let is_expandable = has_body || is_running;
+        let is_expandable = true;
         let colors = cx.theme().colors();
 
         let summary = if is_reasoning {
@@ -1045,59 +1042,28 @@ impl AgentsSurface {
         row = row.child(header);
 
         if expanded {
-            let body_element: AnyElement = if has_body {
-                if matches!(kind, ToolDisplayKind::Command) {
-                    self.render_command_body(title, body, status, cx)
-                } else if is_reasoning {
-                    let source: SharedString = body.to_string().into();
-                    let cache_key = (key.0.clone(), key.1);
-                    let md_entity = self
-                        .markdown_cache
-                        .entry(cache_key)
-                        .or_insert_with(|| {
-                            cx.new(|cx| Markdown::new(source.clone(), None, None, cx))
-                        })
-                        .clone();
-                    md_entity.update(cx, |md, cx| {
-                        md.reset(source, cx);
-                    });
-                    let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-                    div()
-                        .ml(px(20.0))
-                        .text_color(Color::Muted.color(cx))
-                        .child(MarkdownElement::new(md_entity, style))
-                        .into_any_element()
-                } else if kind.body_is_monospace() {
-                    div()
-                        .ml(px(20.0))
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(colors.element_background)
-                        .border_1()
-                        .border_color(colors.border)
-                        .text_xs()
-                        .text_color(Color::Muted.color(cx))
-                        .font_buffer(cx)
-                        .whitespace_normal()
-                        .child(SharedString::from(body.to_string()))
-                        .into_any_element()
-                } else {
-                    div()
-                        .ml(px(20.0))
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(colors.element_background)
-                        .border_1()
-                        .border_color(colors.border)
-                        .text_sm()
-                        .text_color(Color::Muted.color(cx))
-                        .whitespace_normal()
-                        .child(SharedString::from(body.to_string()))
-                        .into_any_element()
-                }
-            } else if is_running {
+            let body_element: AnyElement = if matches!(kind, ToolDisplayKind::Command) {
+                self.render_command_body(title, body, status, cx)
+            } else if has_body && is_reasoning {
+                let source: SharedString = body.to_string().into();
+                let cache_key = (key.0.clone(), key.1);
+                let md_entity = self
+                    .markdown_cache
+                    .entry(cache_key)
+                    .or_insert_with(|| {
+                        cx.new(|cx| Markdown::new(source.clone(), None, None, cx))
+                    })
+                    .clone();
+                md_entity.update(cx, |md, cx| {
+                    md.reset(source, cx);
+                });
+                let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+                div()
+                    .ml(px(20.0))
+                    .text_color(Color::Muted.color(cx))
+                    .child(MarkdownElement::new(md_entity, style))
+                    .into_any_element()
+            } else if has_body && kind.body_is_monospace() {
                 div()
                     .ml(px(20.0))
                     .px_3()
@@ -1106,6 +1072,31 @@ impl AgentsSurface {
                     .bg(colors.element_background)
                     .border_1()
                     .border_color(colors.border)
+                    .text_xs()
+                    .text_color(Color::Muted.color(cx))
+                    .font_buffer(cx)
+                    .whitespace_normal()
+                    .child(SharedString::from(body.to_string()))
+                    .into_any_element()
+            } else if has_body {
+                div()
+                    .ml(px(20.0))
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(colors.element_background)
+                    .border_1()
+                    .border_color(colors.border)
+                    .text_sm()
+                    .text_color(Color::Muted.color(cx))
+                    .whitespace_normal()
+                    .child(SharedString::from(body.to_string()))
+                    .into_any_element()
+            } else if is_running {
+                div()
+                    .ml(px(20.0))
+                    .px_3()
+                    .py_2()
                     .text_sm()
                     .text_color(Color::Muted.color(cx))
                     .child(SharedString::from("Waiting for output…"))
