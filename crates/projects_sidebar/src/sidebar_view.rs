@@ -485,7 +485,7 @@ impl ProjectsSidebar {
                 this.add_new_project(window, cx);
             }))
             .child(
-                Icon::new(IconName::FolderPlus)
+                Icon::new(IconName::Plus)
                     .size(IconSize::Small)
                     .color(Color::Muted),
             )
@@ -599,7 +599,7 @@ impl Render for ProjectsSidebar {
                             .cloned()
                             .collect();
                         let storage_key = paths_storage_key(&paths);
-                        let display_name = key.display_name();
+                        let display_name = key.display_name(&Default::default());
                         let display_path = paths
                             .first()
                             .map(|path| path_display_label(path.as_ref()))

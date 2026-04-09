@@ -33,6 +33,8 @@ pub(crate) struct SerializedHarnessThread {
     pub(crate) title: String,
     pub(crate) cwd: PathBuf,
     pub(crate) messages: Vec<SerializedTranscriptMessage>,
+    #[serde(default)]
+    pub(crate) estimated_tokens: Option<usize>,
 }
 
 #[derive(Deserialize, Serialize)]
