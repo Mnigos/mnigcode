@@ -873,7 +873,28 @@ impl AgentsSurface {
                 md.reset(source, cx);
             });
             let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-            MarkdownElement::new(markdown_entity, style).into_any_element()
+            let workspace_handle = self.workspace.downgrade();
+            MarkdownElement::new(markdown_entity, style)
+                .on_url_click(move |url, window, cx| {
+                    let path = std::path::Path::new(url.as_ref());
+                    if path.is_absolute() && path.exists() {
+                        if let Some(workspace) = workspace_handle.upgrade() {
+                            workspace
+                                .update(cx, |workspace, cx| {
+                                    workspace.open_abs_path(
+                                        path.to_path_buf(),
+                                        Default::default(),
+                                        window,
+                                        cx,
+                                    )
+                                })
+                                .detach_and_log_err(cx);
+                        }
+                    } else {
+                        cx.open_url(&url);
+                    }
+                })
+                .into_any_element()
         } else {
             let text_color = match &message.role {
                 TranscriptRole::System => Color::Warning,
@@ -985,6 +1006,9 @@ impl AgentsSurface {
             .items_center()
             .when(is_expandable, |this| {
                 this.cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_tool_expansion(header_key.0.clone(), header_key.1, cx);
                     }))
@@ -1135,8 +1159,10 @@ impl AgentsSurface {
                             .size(LabelSize::XSmall)
                             .color(Color::Muted),
                     ),
-            )
-            .child(
+            );
+
+        if !command_text.is_empty() {
+            card = card.child(
                 div()
                     .px_3()
                     .pt_2()
@@ -1146,6 +1172,7 @@ impl AgentsSurface {
                     .whitespace_normal()
                     .child(SharedString::from(format!("$ {command_text}"))),
             );
+        }
 
         if let Some(output) = output_text {
             card = card.child(
