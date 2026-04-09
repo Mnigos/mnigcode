@@ -38,6 +38,14 @@ use crate::transcript::{
 
 const CODEX_COMPOSER_WIDTH: Pixels = px(720.0);
 
+fn model_context_window(model: &str) -> usize {
+    match model {
+        "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.3-codex" => 256_000,
+        "gpt-5.2" => 128_000,
+        _ => 256_000,
+    }
+}
+
 const AVAILABLE_MODELS: &[(&str, &str)] = &[
     ("gpt-5.4", "GPT-5.4"),
     ("gpt-5.4-mini", "GPT-5.4-Mini"),
@@ -260,6 +268,7 @@ impl AgentsSurface {
             harness_kind: HarnessKind::Codex,
             run_status: HarnessRunStatus::Idle,
             messages: Vec::new(),
+            estimated_tokens_used: 0,
         };
 
         self.threads_by_path
@@ -386,6 +395,7 @@ impl AgentsSurface {
                 .into();
         }
 
+        thread.estimated_tokens_used += text.len() / 4;
         thread.messages.push(TranscriptMessage {
             role: TranscriptRole::User,
             text: text.clone(),
@@ -428,6 +438,7 @@ impl AgentsSurface {
             HarnessTurnUpdate::AssistantDelta { thread_id, delta } => {
                 if let Some(thread) = self.thread_mut(&thread_id) {
                     thread.run_status = HarnessRunStatus::Running;
+                    thread.estimated_tokens_used += delta.len() / 4;
                     match thread.messages.last_mut() {
                         Some(message) if matches!(message.role, TranscriptRole::Assistant) => {
                             message.text.push_str(&delta);
@@ -614,6 +625,7 @@ impl AgentsSurface {
                                     text: message.text.clone(),
                                 })
                                 .collect(),
+                            estimated_tokens: Some(thread.estimated_tokens_used),
                         })
                         .collect(),
                 })
@@ -671,6 +683,7 @@ impl AgentsSurface {
                     harness_kind: HarnessKind::Codex,
                     run_status: HarnessRunStatus::Idle,
                     messages,
+                    estimated_tokens_used: serialized.estimated_tokens.unwrap_or(0),
                 });
             }
 
@@ -752,6 +765,7 @@ impl Render for AgentsSurface {
                     .pb_5()
                     .gap_2()
                     .child(self.render_composer(cx))
+                    .children(self.render_context_bar(cx))
                     .child(self.render_run_controls(cx)),
             )
             .children(preview_overlay)
@@ -874,21 +888,43 @@ impl AgentsSurface {
             });
             let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
             let workspace_handle = self.workspace.downgrade();
+            let workspace_root = workspace_root_path(&self.workspace, cx);
+            let multi_workspace_weak = self
+                .workspace
+                .read(cx)
+                .multi_workspace()
+                .cloned();
             MarkdownElement::new(markdown_entity, style)
                 .on_url_click(move |url, window, cx| {
-                    let path = std::path::Path::new(url.as_ref());
-                    if path.is_absolute() && path.exists() {
+                    let raw_path = std::path::Path::new(url.as_ref());
+                    let resolved = if raw_path.is_absolute() {
+                        Some(raw_path.to_path_buf())
+                    } else if let Some(root) = &workspace_root {
+                        Some(root.join(raw_path))
+                    } else {
+                        None
+                    };
+
+                    if let Some(resolved) = resolved.filter(|p| p.exists()) {
                         if let Some(workspace) = workspace_handle.upgrade() {
                             workspace
                                 .update(cx, |workspace, cx| {
                                     workspace.open_abs_path(
-                                        path.to_path_buf(),
+                                        resolved,
                                         Default::default(),
                                         window,
                                         cx,
                                     )
                                 })
                                 .detach_and_log_err(cx);
+                        }
+                        if let Some(mw) = multi_workspace_weak
+                            .as_ref()
+                            .and_then(|weak| weak.upgrade())
+                        {
+                            mw.update(cx, |mw, cx| {
+                                mw.set_center_surface(None, cx);
+                            });
                         }
                     } else {
                         cx.open_url(&url);
@@ -940,7 +976,10 @@ impl AgentsSurface {
         let expanded = self.expanded_tool_messages.contains(&key);
         let has_body = !body.trim().is_empty();
         let is_running = status == ToolStatus::Running;
-        let is_expandable = true;
+        let is_expandable = match kind {
+            ToolDisplayKind::Command | ToolDisplayKind::Reasoning => true,
+            _ => has_body || is_running,
+        };
         let colors = cx.theme().colors();
 
         let summary = if is_reasoning {
@@ -1629,7 +1668,62 @@ impl AgentsSurface {
             })
     }
 
-    fn render_run_controls(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_context_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thread = self.active_thread(cx)?;
+        if thread.estimated_tokens_used == 0 {
+            return None;
+        }
+
+        let max_tokens = model_context_window(&self.selected_model) as f32;
+        let used = thread.estimated_tokens_used as f32;
+        let percentage = ((used / max_tokens) * 100.0).min(100.0) as u32;
+        let used_label = if used >= 1000.0 {
+            format!("~{}k", (used / 1000.0) as u32)
+        } else {
+            format!("~{}", used as u32)
+        };
+        let max_label = format!("{}k", (max_tokens / 1000.0) as u32);
+        let bar_color = if percentage >= 85 {
+            cx.theme().status().warning
+        } else {
+            cx.theme().status().info
+        };
+        let fraction = (used / max_tokens).min(1.0);
+
+        Some(
+            h_flex()
+                .id("codex-context-bar")
+                .w(CODEX_COMPOSER_WIDTH)
+                .px_2()
+                .gap_2()
+                .items_center()
+                .tooltip(Tooltip::text(format!(
+                    "~{percentage}% context used ({used_label} / {max_label} tokens)"
+                )))
+                .child(
+                    div()
+                        .flex_1()
+                        .h(px(3.0))
+                        .rounded_full()
+                        .bg(cx.theme().colors().border)
+                        .child(
+                            div()
+                                .h_full()
+                                .rounded_full()
+                                .bg(bar_color)
+                                .w(gpui::relative(fraction)),
+                        ),
+                )
+                .child(
+                    Label::new(format!("{used_label} / {max_label}"))
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_run_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
             .w(CODEX_COMPOSER_WIDTH)
             .px_2()
@@ -1655,13 +1749,72 @@ impl AgentsSurface {
                     .style(ButtonStyle::Subtle),
             )
             .child(div().flex_1())
-            .child(
-                Button::new("codex-branch-selector", "main")
+            .child(self.render_branch_selector(cx))
+    }
+
+    fn render_branch_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let project = self.workspace.read(cx).project().clone();
+        let repo = project.read(cx).active_repository(cx);
+
+        let (branch_label, branch_list) = if let Some(repo) = repo.as_ref() {
+            let snapshot = repo.read(cx).snapshot();
+            let label: SharedString = snapshot
+                .branch
+                .as_ref()
+                .map(|b| SharedString::from(b.name().to_string()))
+                .unwrap_or_else(|| "no branch".into());
+            let list: Vec<(String, bool)> = snapshot
+                .branch_list
+                .iter()
+                .map(|b| (b.name().to_string(), b.is_head))
+                .collect();
+            (label, list)
+        } else {
+            ("no branch".into(), Vec::new())
+        };
+
+        let repo_weak = repo.map(|r| r.downgrade());
+
+        PopoverMenu::new("codex-branch-selector")
+            .anchor(gpui::Corner::TopRight)
+            .trigger(
+                Button::new("codex-branch-btn", branch_label)
                     .label_size(LabelSize::Small)
                     .color(Color::Muted)
                     .start_icon(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
                     .style(ButtonStyle::Subtle),
             )
+            .menu(move |window, cx| {
+                let repo_weak = repo_weak.clone()?;
+                let repo = repo_weak.upgrade()?;
+                let current_name = repo
+                    .read(cx)
+                    .snapshot()
+                    .branch
+                    .as_ref()
+                    .map(|b| b.name().to_string());
+                Some(ContextMenu::build(window, cx, |mut menu, _window, _cx| {
+                    for (name, _is_head) in &branch_list {
+                        let is_selected = current_name.as_deref() == Some(name.as_str());
+                        let repo_weak = repo_weak.clone();
+                        let branch_name = name.clone();
+                        menu = menu.toggleable_entry(
+                            name.clone(),
+                            is_selected,
+                            IconPosition::Start,
+                            None,
+                            move |_, cx| {
+                                if let Some(repo) = repo_weak.upgrade() {
+                                    repo.update(cx, |repo, _cx| {
+                                        let _ = repo.change_branch(branch_name.clone());
+                                    });
+                                }
+                            },
+                        );
+                    }
+                    menu
+                }))
+            })
     }
 }
 

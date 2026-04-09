@@ -13502,6 +13502,7 @@ dependencies = [
  "log",
  "markdown",
  "menu",
+ "project",
  "serde",
  "serde_json",
  "smol",
