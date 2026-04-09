@@ -4,6 +4,7 @@ use gpui::{
     PathPromptOptions, Pixels, Render, ScrollHandle, SharedString, Subscription, Window, deferred,
     img, px,
 };
+use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use language::language_settings::SoftWrap;
 use menu::Confirm;
 use smol::channel;
@@ -44,6 +45,7 @@ pub struct AgentsSurface {
     pending_attachments: Vec<PathBuf>,
     previewing_attachment: Option<PathBuf>,
     expanded_tool_messages: HashSet<(SharedString, usize)>,
+    markdown_cache: HashMap<(SharedString, usize), Entity<Markdown>>,
     transcript_scroll_handle: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -88,6 +90,7 @@ impl AgentsSurface {
             pending_attachments: Vec::new(),
             previewing_attachment: None,
             expanded_tool_messages: HashSet::new(),
+            markdown_cache: HashMap::new(),
             transcript_scroll_handle: ScrollHandle::new(),
             _subscriptions: vec![active_workspace_subscription],
         }
@@ -688,7 +691,7 @@ impl Render for AgentsSurface {
 
 impl AgentsSurface {
     fn render_transcript(
-        &self,
+        &mut self,
         thread: &HarnessThread,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -696,7 +699,7 @@ impl AgentsSurface {
         let thread_id = thread.id.0.clone();
         let mut messages = Vec::new();
         for (index, message) in thread.messages.iter().enumerate() {
-            messages.push(self.render_message(thread_id.clone(), index, message, cx));
+            messages.push(self.render_message(thread_id.clone(), index, message, window, cx));
         }
 
         let status_indicator = thread.run_status.is_active().then(|| {
@@ -748,10 +751,11 @@ impl AgentsSurface {
     }
 
     fn render_message(
-        &self,
+        &mut self,
         thread_id: SharedString,
         index: usize,
         message: &TranscriptMessage,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if let TranscriptRole::Tool {
@@ -773,28 +777,48 @@ impl AgentsSurface {
         }
 
         let colors = cx.theme().colors();
-        let (label, label_color, text_color, background): (SharedString, Color, Color, gpui::Hsla) =
+        let is_assistant = matches!(message.role, TranscriptRole::Assistant);
+        let (label, label_color, background): (SharedString, Color, gpui::Hsla) =
             match &message.role {
-                TranscriptRole::User => (
-                    "You".into(),
-                    Color::Muted,
-                    Color::Default,
-                    colors.element_background,
-                ),
-                TranscriptRole::Assistant => (
-                    "Codex".into(),
-                    Color::Muted,
-                    Color::Default,
-                    colors.editor_background,
-                ),
-                TranscriptRole::System => (
-                    "System".into(),
-                    Color::Warning,
-                    Color::Warning,
-                    colors.element_hover,
-                ),
+                TranscriptRole::User => ("You".into(), Color::Muted, colors.element_background),
+                TranscriptRole::Assistant => {
+                    ("Codex".into(), Color::Muted, colors.editor_background)
+                }
+                TranscriptRole::System => {
+                    ("System".into(), Color::Warning, colors.element_hover)
+                }
                 TranscriptRole::Tool { .. } => unreachable!(),
             };
+
+        let body: AnyElement = if is_assistant && !message.text.is_empty() {
+            let source: SharedString = message.text.clone().into();
+            let cache_key = (thread_id, index);
+            let markdown_entity = self
+                .markdown_cache
+                .entry(cache_key)
+                .or_insert_with(|| cx.new(|cx| Markdown::new(source.clone(), None, None, cx)))
+                .clone();
+            markdown_entity.update(cx, |md, cx| {
+                md.reset(source, cx);
+            });
+            let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
+            MarkdownElement::new(markdown_entity, style).into_any_element()
+        } else {
+            let text_color = match &message.role {
+                TranscriptRole::System => Color::Warning,
+                _ => Color::Default,
+            };
+            div()
+                .text_color(text_color.color(cx))
+                .text_sm()
+                .whitespace_normal()
+                .child(if message.text.is_empty() {
+                    SharedString::from(" ")
+                } else {
+                    SharedString::from(message.text.clone())
+                })
+                .into_any_element()
+        };
 
         v_flex()
             .id(("harness-message", index))
@@ -804,17 +828,7 @@ impl AgentsSurface {
             .bg(background)
             .p_3()
             .child(Label::new(label).size(LabelSize::Small).color(label_color))
-            .child(
-                div()
-                    .text_color(text_color.color(cx))
-                    .text_sm()
-                    .whitespace_normal()
-                    .child(if message.text.is_empty() {
-                        SharedString::from(" ")
-                    } else {
-                        SharedString::from(message.text.clone())
-                    }),
-            )
+            .child(body)
             .into_any_element()
     }
 
