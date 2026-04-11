@@ -12,15 +12,15 @@ use menu::Confirm;
 
 pub use sidebar_view::ProjectsSidebar;
 
-pub(crate) const CODEX_COMPOSER_KEY_CONTEXT: &str = "CodexComposer";
+pub(crate) const COMPOSER_KEY_CONTEXT: &str = "AgentComposer";
 
 pub fn init(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("enter", Confirm, Some("CodexComposer > Editor")),
+        KeyBinding::new("enter", Confirm, Some("AgentComposer > Editor")),
         KeyBinding::new(
             "alt-enter",
             editor::actions::Newline,
-            Some("CodexComposer > Editor"),
+            Some("AgentComposer > Editor"),
         ),
     ]);
 }

@@ -376,7 +376,7 @@ impl ProjectsSidebar {
         let harness_label: SharedString = match &thread.run_status {
             HarnessRunStatus::Failed(message) => message.clone(),
             _ => match thread.harness_kind {
-                HarnessKind::Codex => "Codex app-server".into(),
+                HarnessKind::Codex => "Codex".into(),
             },
         };
         let icon = if is_running {
@@ -449,7 +449,7 @@ impl ProjectsSidebar {
             .px_2()
             .gap_2()
             .hover(|style| style.bg(cx.theme().colors().element_hover))
-            .tooltip(Tooltip::text("Start a Codex thread in this project"))
+            .tooltip(Tooltip::text("Start a new thread in this project"))
             .on_click(cx.listener(move |this, _, window, cx| {
                 if let Some(workspace) = loaded_workspace.clone() {
                     this.start_thread(workspace, window, cx);
@@ -652,7 +652,7 @@ impl Render for ProjectsSidebar {
                     .gap_1()
                     .child(Label::new("Mnig Code").size(LabelSize::Large))
                     .child(
-                        Label::new("Projects and Codex threads")
+                        Label::new("Projects and threads")
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     ),

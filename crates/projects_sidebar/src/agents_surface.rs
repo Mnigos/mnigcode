@@ -17,7 +17,7 @@ use ui::{
 };
 use workspace::{MultiWorkspace, MultiWorkspaceEvent};
 
-use crate::CODEX_COMPOSER_KEY_CONTEXT;
+use crate::COMPOSER_KEY_CONTEXT;
 use crate::harness::{
     HarnessApprovalPolicy, HarnessKind, HarnessRunStatus, HarnessSandboxPolicy, HarnessThreadId,
     HarnessToolPhase, HarnessTurnRequest, HarnessTurnUpdate, run_codex_app_server_turn,
@@ -36,7 +36,7 @@ use crate::transcript::{
     TranscriptRole,
 };
 
-const CODEX_COMPOSER_WIDTH: Pixels = px(720.0);
+const COMPOSER_WIDTH: Pixels = px(720.0);
 
 fn model_context_window(model: &str) -> usize {
     match model {
@@ -92,7 +92,7 @@ impl AgentsSurface {
             let mut editor = Editor::auto_height(1, 8, window, cx);
             editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
             editor.set_placeholder_text(
-                "Ask Codex anything, @ to add files, / for commands",
+                "Ask anything, @ to add files, / for commands",
                 window,
                 cx,
             );
@@ -377,7 +377,7 @@ impl AgentsSurface {
             thread.messages.push(TranscriptMessage {
                 role: TranscriptRole::System,
                 text:
-                    "Codex is already working on this thread. Please wait for this turn to finish."
+                    "Agent is already working on this thread. Please wait for this turn to finish."
                         .to_string(),
             });
             cx.notify();
@@ -555,7 +555,7 @@ impl AgentsSurface {
                     }
                     thread.messages.push(TranscriptMessage {
                         role: TranscriptRole::System,
-                        text: format!("Codex failed: {message}"),
+                        text: format!("Agent failed: {message}"),
                     });
                 }
             }
@@ -738,7 +738,7 @@ impl Render for AgentsSurface {
 
         v_flex()
             .id("agents-surface")
-            .key_context(CODEX_COMPOSER_KEY_CONTEXT)
+            .key_context(COMPOSER_KEY_CONTEXT)
             .on_action(cx.listener(Self::send_message))
             .size_full()
             .relative()
@@ -798,10 +798,10 @@ impl AgentsSurface {
                 )
                 .child(
                     Label::new(match thread.run_status {
-                        HarnessRunStatus::Connecting => "Connecting to Codex",
-                        HarnessRunStatus::Thinking => "Codex is thinking",
-                        HarnessRunStatus::Running => "Codex is working",
-                        _ => "Codex is working",
+                        HarnessRunStatus::Connecting => "Connecting…",
+                        HarnessRunStatus::Thinking => "Thinking…",
+                        HarnessRunStatus::Running => "Working…",
+                        _ => "Working…",
                     })
                     .size(LabelSize::Small)
                     .color(Color::Muted),
@@ -809,21 +809,21 @@ impl AgentsSurface {
         });
 
         v_flex()
-            .id("codex-transcript-container")
+            .id("agent-transcript-container")
             .flex_1()
             .w_full()
             .relative()
             .overflow_hidden()
             .child(
                 v_flex()
-                    .id("codex-transcript-scroll")
+                    .id("agent-transcript-scroll")
                     .size_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.transcript_scroll_handle)
                     .items_center()
                     .child(
                         v_flex()
-                            .w(CODEX_COMPOSER_WIDTH)
+                            .w(COMPOSER_WIDTH)
                             .gap_4()
                             .py_8()
                             .children(messages)
@@ -1300,8 +1300,8 @@ impl AgentsSurface {
         let colors = cx.theme().colors();
 
         v_flex()
-            .id("codex-composer")
-            .w(CODEX_COMPOSER_WIDTH)
+            .id("agent-composer")
+            .w(COMPOSER_WIDTH)
             .relative()
             .rounded_xl()
             .border_1()
@@ -1343,7 +1343,7 @@ impl AgentsSurface {
                     .gap_1()
                     .items_center()
                     .child(
-                        IconButton::new("codex-composer-attach", IconName::Plus)
+                        IconButton::new("agent-composer-attach", IconName::Plus)
                             .icon_size(IconSize::Small)
                             .style(ButtonStyle::Subtle)
                             .tooltip(Tooltip::text("Attach files or images"))
@@ -1355,13 +1355,13 @@ impl AgentsSurface {
                     .child(self.render_reasoning_selector(cx))
                     .child(div().flex_1())
                     .child(
-                        IconButton::new("codex-composer-mic", IconName::Mic)
+                        IconButton::new("agent-composer-mic", IconName::Mic)
                             .icon_size(IconSize::Small)
                             .style(ButtonStyle::Subtle)
                             .tooltip(Tooltip::text("Voice input")),
                     )
                     .child(if is_running {
-                        IconButton::new("codex-composer-stop", IconName::Stop)
+                        IconButton::new("agent-composer-stop", IconName::Stop)
                             .icon_size(IconSize::Small)
                             .style(ButtonStyle::Tinted(TintColor::Error))
                             .tooltip(Tooltip::text("Stop generation"))
@@ -1370,7 +1370,7 @@ impl AgentsSurface {
                             }))
                             .into_any_element()
                     } else {
-                        IconButton::new("codex-composer-send", IconName::ArrowUp)
+                        IconButton::new("agent-composer-send", IconName::ArrowUp)
                             .icon_size(IconSize::Small)
                             .style(ButtonStyle::Filled)
                             .tooltip(Tooltip::text("Send message"))
@@ -1417,7 +1417,7 @@ impl AgentsSurface {
 
                 let clickable_path = path.clone();
                 let chip = h_flex()
-                    .id(("codex-attachment", index))
+                    .id(("agent-attachment", index))
                     .h(px(28.0))
                     .gap_1p5()
                     .px_2()
@@ -1441,7 +1441,7 @@ impl AgentsSurface {
                             .truncate(),
                     )
                     .child(
-                        IconButton::new(("codex-attachment-remove", index), IconName::Close)
+                        IconButton::new(("agent-attachment-remove", index), IconName::Close)
                             .icon_size(IconSize::XSmall)
                             .style(ButtonStyle::Subtle)
                             .tooltip(Tooltip::text("Remove attachment"))
@@ -1503,7 +1503,7 @@ impl AgentsSurface {
         Some(
             deferred(
                 div()
-                    .id("codex-attachment-preview-overlay")
+                    .id("agent-attachment-preview-overlay")
                     .absolute()
                     .inset_0()
                     .size_full()
@@ -1520,7 +1520,7 @@ impl AgentsSurface {
                     )
                     .child(
                         v_flex()
-                            .id("codex-attachment-preview-card")
+                            .id("agent-attachment-preview-card")
                             .w(px(960.0))
                             .gap_2()
                             .rounded_xl()
@@ -1544,7 +1544,7 @@ impl AgentsSurface {
                                     .child(div().flex_1())
                                     .child(
                                         IconButton::new(
-                                            "codex-attachment-preview-close",
+                                            "agent-attachment-preview-close",
                                             IconName::Close,
                                         )
                                         .icon_size(IconSize::Small)
@@ -1587,10 +1587,10 @@ impl AgentsSurface {
             .into();
 
         let this = cx.entity().downgrade();
-        PopoverMenu::new("codex-model-selector")
+        PopoverMenu::new("agent-model-selector")
             .anchor(gpui::Corner::TopLeft)
             .trigger(
-                Button::new("codex-composer-model", current_label)
+                Button::new("agent-composer-model", current_label)
                     .label_size(LabelSize::Small)
                     .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
                     .style(ButtonStyle::Subtle),
@@ -1632,10 +1632,10 @@ impl AgentsSurface {
             .into();
 
         let this = cx.entity().downgrade();
-        PopoverMenu::new("codex-reasoning-selector")
+        PopoverMenu::new("agent-reasoning-selector")
             .anchor(gpui::Corner::TopLeft)
             .trigger(
-                Button::new("codex-composer-reasoning", current_label)
+                Button::new("agent-composer-reasoning", current_label)
                     .label_size(LabelSize::Small)
                     .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
                     .style(ButtonStyle::Subtle),
@@ -1692,8 +1692,8 @@ impl AgentsSurface {
 
         Some(
             h_flex()
-                .id("codex-context-bar")
-                .w(CODEX_COMPOSER_WIDTH)
+                .id("agent-context-bar")
+                .w(COMPOSER_WIDTH)
                 .px_2()
                 .gap_2()
                 .items_center()
@@ -1725,19 +1725,19 @@ impl AgentsSurface {
 
     fn render_run_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
-            .w(CODEX_COMPOSER_WIDTH)
+            .w(COMPOSER_WIDTH)
             .px_2()
             .gap_3()
             .items_center()
             .child(
-                Button::new("codex-env-selector", "Local")
+                Button::new("agent-env-selector", "Local")
                     .label_size(LabelSize::Small)
                     .color(Color::Muted)
                     .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
                     .style(ButtonStyle::Subtle),
             )
             .child(
-                Button::new("codex-permission-selector", "Full access")
+                Button::new("agent-permission-selector", "Full access")
                     .label_size(LabelSize::Small)
                     .color(Color::Warning)
                     .start_icon(
@@ -1775,10 +1775,10 @@ impl AgentsSurface {
 
         let repo_weak = repo.map(|r| r.downgrade());
 
-        PopoverMenu::new("codex-branch-selector")
+        PopoverMenu::new("agent-branch-selector")
             .anchor(gpui::Corner::TopRight)
             .trigger(
-                Button::new("codex-branch-btn", branch_label)
+                Button::new("agent-branch-btn", branch_label)
                     .label_size(LabelSize::Small)
                     .color(Color::Muted)
                     .start_icon(Icon::new(IconName::GitBranch).size(IconSize::XSmall))
