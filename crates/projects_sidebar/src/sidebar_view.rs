@@ -7,7 +7,9 @@ use std::{
     path::PathBuf,
 };
 use ui::{CommonAnimationExt, Tooltip, prelude::*};
-use workspace::{MultiWorkspace, MultiWorkspaceEvent, OpenMode, SidebarEvent, SidebarSide};
+use workspace::{
+    MultiWorkspace, MultiWorkspaceEvent, OpenMode, ProjectGroup, SidebarEvent, SidebarSide,
+};
 
 use crate::agents_surface::AgentsSurface;
 use crate::harness::{HarnessKind, HarnessRunStatus};
@@ -60,6 +62,9 @@ impl ProjectsSidebar {
                     cx.notify();
                 }
                 MultiWorkspaceEvent::WorkspaceRemoved(_) => {
+                    cx.notify();
+                }
+                MultiWorkspaceEvent::ProjectGroupsChanged => {
                     cx.notify();
                 }
             },
@@ -591,7 +596,8 @@ impl Render for ProjectsSidebar {
                 multi_workspace
                     .read(cx)
                     .project_groups(cx)
-                    .map(|(key, workspaces)| {
+                    .into_iter()
+                    .map(|ProjectGroup { key, workspaces, .. }| {
                         let paths: Vec<PathBuf> = key
                             .path_list()
                             .paths()

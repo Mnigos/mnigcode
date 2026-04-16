@@ -73,7 +73,8 @@ pub struct AgentsSurface {
     previewing_attachment: Option<PathBuf>,
     selected_model: String,
     selected_reasoning_effort: String,
-    running_turn_tasks: Vec<Task<()>>,
+    running_turn_tasks: HashMap<u64, Task<()>>,
+    next_turn_task_id: u64,
     expanded_tool_messages: HashSet<(SharedString, usize)>,
     markdown_cache: HashMap<(SharedString, usize), Entity<Markdown>>,
     transcript_scroll_handle: ScrollHandle,
@@ -121,7 +122,8 @@ impl AgentsSurface {
             previewing_attachment: None,
             selected_model: DEFAULT_MODEL.to_string(),
             selected_reasoning_effort: DEFAULT_REASONING_EFFORT.to_string(),
-            running_turn_tasks: Vec::new(),
+            running_turn_tasks: HashMap::new(),
+            next_turn_task_id: 0,
             expanded_tool_messages: HashSet::new(),
             markdown_cache: HashMap::new(),
             transcript_scroll_handle: ScrollHandle::new(),
@@ -350,7 +352,10 @@ impl AgentsSurface {
         let (updates_sender, updates_receiver) = channel::unbounded();
         let bg_task =
             cx.background_spawn(run_codex_app_server_turn(request, updates_sender));
-        let fg_task = cx.spawn(async move |this, cx| {
+        let turn_task_id = self.next_turn_task_id;
+        self.next_turn_task_id = self.next_turn_task_id.wrapping_add(1);
+        self.running_turn_tasks.insert(turn_task_id, bg_task);
+        cx.spawn(async move |this, cx| {
             while let Ok(update) = updates_receiver.recv().await {
                 if let Err(error) = this.update(cx, |this, cx| {
                     this.apply_turn_update(update, cx);
@@ -359,9 +364,12 @@ impl AgentsSurface {
                     break;
                 }
             }
-        });
-        self.running_turn_tasks.push(bg_task);
-        self.running_turn_tasks.push(fg_task);
+            this.update(cx, |this, _| {
+                this.running_turn_tasks.remove(&turn_task_id);
+            })
+            .ok();
+        })
+        .detach();
 
         cx.notify();
     }
@@ -571,6 +579,18 @@ impl AgentsSurface {
             .find(|thread| &thread.id == thread_id)
     }
 
+    fn prune_markdown_cache(&mut self) {
+        let mut valid = HashSet::new();
+        for threads in self.threads_by_path.values() {
+            for thread in threads {
+                for index in 0..thread.messages.len() {
+                    valid.insert((thread.id.0.clone(), index));
+                }
+            }
+        }
+        self.markdown_cache.retain(|key, _| valid.contains(key));
+    }
+
     fn active_thread(&self, cx: &App) -> Option<&HarnessThread> {
         let workspace_path = workspace_storage_key(&self.workspace, cx)?;
         let thread_id = self.active_thread_by_path.get(&workspace_path)?;
@@ -699,6 +719,8 @@ impl AgentsSurface {
         if self.next_thread_number <= max_thread_number {
             self.next_thread_number = max_thread_number + 1;
         }
+
+        self.prune_markdown_cache();
     }
 
     pub(crate) fn next_thread_number(&self) -> usize {
