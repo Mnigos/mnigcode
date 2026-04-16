@@ -317,21 +317,11 @@ impl AgentsSurface {
 
     fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let has_attachments = !self.pending_attachments.is_empty();
-
-        let text = self.composer_editor.update(cx, |editor, cx| {
-            let text = editor.text(cx).trim().to_string();
-            if !text.is_empty() || has_attachments {
-                editor.clear(window, cx);
-            }
-            text
-        });
+        let text = self.composer_editor.read(cx).text(cx).trim().to_string();
 
         if text.is_empty() && !has_attachments {
             return;
         }
-
-        let attachments = std::mem::take(&mut self.pending_attachments);
-        let combined_input = build_input_with_attachments(&text, &attachments);
 
         let workspace = self.workspace.clone();
         let Some(workspace_path) = workspace_storage_key(&workspace, cx) else {
@@ -344,6 +334,15 @@ impl AgentsSurface {
         } else {
             return;
         };
+
+        // Only consume the composer input once we know we have a destination
+        // thread to submit it to. Any failure past this point (e.g. the thread
+        // is already running a turn) surfaces feedback in the transcript.
+        self.composer_editor.update(cx, |editor, cx| {
+            editor.clear(window, cx);
+        });
+        let attachments = std::mem::take(&mut self.pending_attachments);
+        let combined_input = build_input_with_attachments(&text, &attachments);
 
         let Some(request) = self.prepare_turn_request(thread_id.clone(), combined_input, cx) else {
             return;
