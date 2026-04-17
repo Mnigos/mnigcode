@@ -73,7 +73,7 @@ pub struct AgentsSurface {
     previewing_attachment: Option<PathBuf>,
     selected_model: String,
     selected_reasoning_effort: String,
-    running_turn_tasks: HashMap<u64, Task<()>>,
+    running_turn_tasks: HashMap<u64, (HarnessThreadId, Task<()>)>,
     next_turn_task_id: u64,
     expanded_tool_messages: HashSet<(SharedString, usize)>,
     markdown_cache: HashMap<(SharedString, usize), Entity<Markdown>>,
@@ -293,21 +293,24 @@ impl AgentsSurface {
     }
 
     fn stop_active_turn(&mut self, cx: &mut Context<Self>) {
-        // Dropping the tasks kills the codex child process (kill_on_drop)
-        // and stops the receiver loop.
-        self.running_turn_tasks.clear();
+        let Some(workspace_path) = workspace_storage_key(&self.workspace, cx) else {
+            return;
+        };
+        let Some(thread_id) = self.active_thread_by_path.get(&workspace_path).cloned() else {
+            return;
+        };
 
-        // Mark the active thread as idle and any running tool calls as failed.
-        if let Some(workspace_path) = workspace_storage_key(&self.workspace, cx) {
-            if let Some(thread_id) = self.active_thread_by_path.get(&workspace_path).cloned() {
-                if let Some(thread) = self.thread_mut(&thread_id) {
-                    thread.run_status = HarnessRunStatus::Idle;
-                    for message in thread.messages.iter_mut() {
-                        if let TranscriptRole::Tool { status, .. } = &mut message.role {
-                            if *status == ToolStatus::Running {
-                                *status = ToolStatus::Failed;
-                            }
-                        }
+        // Only drop tasks for the active thread; other threads and projects
+        // may have concurrent turns in flight that we must not cancel.
+        self.running_turn_tasks
+            .retain(|_, (tid, _)| tid != &thread_id);
+
+        if let Some(thread) = self.thread_mut(&thread_id) {
+            thread.run_status = HarnessRunStatus::Idle;
+            for message in thread.messages.iter_mut() {
+                if let TranscriptRole::Tool { status, .. } = &mut message.role {
+                    if *status == ToolStatus::Running {
+                        *status = ToolStatus::Failed;
                     }
                 }
             }
@@ -353,7 +356,8 @@ impl AgentsSurface {
             cx.background_spawn(run_codex_app_server_turn(request, updates_sender));
         let turn_task_id = self.next_turn_task_id;
         self.next_turn_task_id = self.next_turn_task_id.wrapping_add(1);
-        self.running_turn_tasks.insert(turn_task_id, bg_task);
+        self.running_turn_tasks
+            .insert(turn_task_id, (thread_id.clone(), bg_task));
         cx.spawn(async move |this, cx| {
             while let Ok(update) = updates_receiver.recv().await {
                 if let Err(error) = this.update(cx, |this, cx| {
