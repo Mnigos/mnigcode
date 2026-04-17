@@ -19,8 +19,9 @@ use workspace::{MultiWorkspace, MultiWorkspaceEvent};
 
 use crate::COMPOSER_KEY_CONTEXT;
 use crate::harness::{
-    HarnessApprovalPolicy, HarnessKind, HarnessRunStatus, HarnessSandboxPolicy, HarnessThreadId,
-    HarnessToolPhase, HarnessTurnRequest, HarnessTurnUpdate, run_codex_app_server_turn,
+    HarnessApprovalPolicy, HarnessKind, HarnessRunStatus, HarnessSandboxPolicy,
+    HarnessSessionConfig, HarnessThreadId, HarnessToolPhase, HarnessTurnInput, HarnessTurnUpdate,
+    run_codex_app_server_session,
 };
 use crate::helpers::{
     animated_thinking_label, attachment_display_name, attachment_icon, build_input_with_attachments,
@@ -63,6 +64,12 @@ const REASONING_EFFORTS: &[(&str, &str)] = &[
 
 const DEFAULT_REASONING_EFFORT: &str = "high";
 
+struct CodexSessionHandle {
+    turns: channel::Sender<HarnessTurnInput>,
+    _session_task: Task<()>,
+    _update_task: Task<()>,
+}
+
 pub struct AgentsSurface {
     workspace: Entity<workspace::Workspace>,
     composer_editor: Entity<Editor>,
@@ -73,8 +80,7 @@ pub struct AgentsSurface {
     previewing_attachment: Option<PathBuf>,
     selected_model: String,
     selected_reasoning_effort: String,
-    running_turn_tasks: HashMap<u64, (HarnessThreadId, Task<()>)>,
-    next_turn_task_id: u64,
+    codex_sessions: HashMap<HarnessThreadId, CodexSessionHandle>,
     expanded_tool_messages: HashSet<(SharedString, usize)>,
     markdown_cache: HashMap<(SharedString, usize), Entity<Markdown>>,
     transcript_scroll_handle: ScrollHandle,
@@ -122,8 +128,7 @@ impl AgentsSurface {
             previewing_attachment: None,
             selected_model: DEFAULT_MODEL.to_string(),
             selected_reasoning_effort: DEFAULT_REASONING_EFFORT.to_string(),
-            running_turn_tasks: HashMap::new(),
-            next_turn_task_id: 0,
+            codex_sessions: HashMap::new(),
             expanded_tool_messages: HashSet::new(),
             markdown_cache: HashMap::new(),
             transcript_scroll_handle: ScrollHandle::new(),
@@ -300,10 +305,11 @@ impl AgentsSurface {
             return;
         };
 
-        // Only drop tasks for the active thread; other threads and projects
-        // may have concurrent turns in flight that we must not cancel.
-        self.running_turn_tasks
-            .retain(|_, (tid, _)| tid != &thread_id);
+        // Drop the active thread's codex session to kill its child process
+        // and cancel the in-flight turn. Other threads' sessions are left
+        // untouched so concurrent runs keep going. The next submit on this
+        // thread will start a fresh session via thread/resume.
+        self.codex_sessions.remove(&thread_id);
 
         if let Some(thread) = self.thread_mut(&thread_id) {
             thread.run_status = HarnessRunStatus::Idle;
@@ -332,7 +338,7 @@ impl AgentsSurface {
         };
         let thread_id = if let Some(existing) = self.active_thread_by_path.get(&workspace_path) {
             existing.clone()
-        } else if let Some(new_id) = self.start_thread(workspace.clone(), cx) {
+        } else if let Some(new_id) = self.start_thread(workspace, cx) {
             new_id
         } else {
             return;
@@ -363,18 +369,63 @@ impl AgentsSurface {
         let attachments = std::mem::take(&mut self.pending_attachments);
         let combined_input = build_input_with_attachments(&text, &attachments);
 
-        let Some(request) = self.prepare_turn_request(thread_id.clone(), combined_input, cx) else {
+        let Some(turn_input) = self.prepare_turn_input(thread_id.clone(), combined_input, cx)
+        else {
             return;
         };
 
+        let Some(session_sender) = self.ensure_codex_session(&thread_id, cx) else {
+            return;
+        };
+        if session_sender.try_send(turn_input).is_err() {
+            if let Some(thread) = self.thread_mut(&thread_id) {
+                thread.run_status = HarnessRunStatus::Failed("codex session closed".into());
+                thread.messages.push(TranscriptMessage {
+                    role: TranscriptRole::System,
+                    text: "Agent session closed unexpectedly. Please try again.".to_string(),
+                });
+            }
+            self.codex_sessions.remove(&thread_id);
+        }
+
+        cx.notify();
+    }
+
+    fn ensure_codex_session(
+        &mut self,
+        thread_id: &HarnessThreadId,
+        cx: &mut Context<Self>,
+    ) -> Option<channel::Sender<HarnessTurnInput>> {
+        if let Some(session) = self.codex_sessions.get(thread_id) {
+            if !session.turns.is_closed() {
+                return Some(session.turns.clone());
+            }
+            self.codex_sessions.remove(thread_id);
+        }
+
+        let thread = self
+            .threads_by_path
+            .values()
+            .flat_map(|threads| threads.iter())
+            .find(|thread| &thread.id == thread_id)?;
+
+        let config = HarnessSessionConfig {
+            thread_id: thread_id.clone(),
+            provider_thread_id: thread.provider_thread_id.clone(),
+            cwd: thread.cwd.clone(),
+            model: self.selected_model.clone(),
+            approval_policy: HarnessApprovalPolicy::Never,
+            sandbox_policy: HarnessSandboxPolicy::DangerFullAccess,
+        };
+
+        let (turns_sender, turns_receiver) = channel::unbounded();
         let (updates_sender, updates_receiver) = channel::unbounded();
-        let bg_task =
-            cx.background_spawn(run_codex_app_server_turn(request, updates_sender));
-        let turn_task_id = self.next_turn_task_id;
-        self.next_turn_task_id = self.next_turn_task_id.wrapping_add(1);
-        self.running_turn_tasks
-            .insert(turn_task_id, (thread_id.clone(), bg_task));
-        cx.spawn(async move |this, cx| {
+        let session_task = cx.background_spawn(run_codex_app_server_session(
+            config,
+            turns_receiver,
+            updates_sender,
+        ));
+        let update_task = cx.spawn(async move |this, cx| {
             while let Ok(update) = updates_receiver.recv().await {
                 if let Err(error) = this.update(cx, |this, cx| {
                     this.apply_turn_update(update, cx);
@@ -383,33 +434,26 @@ impl AgentsSurface {
                     break;
                 }
             }
-            this.update(cx, |this, _| {
-                this.running_turn_tasks.remove(&turn_task_id);
-            })
-            .ok();
-        })
-        .detach();
+        });
 
-        cx.notify();
+        self.codex_sessions.insert(
+            thread_id.clone(),
+            CodexSessionHandle {
+                turns: turns_sender.clone(),
+                _session_task: session_task,
+                _update_task: update_task,
+            },
+        );
+        Some(turns_sender)
     }
 
-    fn prepare_turn_request(
+    fn prepare_turn_input(
         &mut self,
         thread_id: HarnessThreadId,
         text: String,
         cx: &mut Context<Self>,
-    ) -> Option<HarnessTurnRequest> {
+    ) -> Option<HarnessTurnInput> {
         let thread = self.thread_mut(&thread_id)?;
-        if thread.run_status.is_active() {
-            thread.messages.push(TranscriptMessage {
-                role: TranscriptRole::System,
-                text:
-                    "Agent is already working on this thread. Please wait for this turn to finish."
-                        .to_string(),
-            });
-            cx.notify();
-            return None;
-        }
 
         if thread.messages.is_empty() {
             thread.title = text
@@ -432,11 +476,9 @@ impl AgentsSurface {
             text: String::new(),
         });
         thread.run_status = HarnessRunStatus::Connecting;
+        cx.notify();
 
-        Some(HarnessTurnRequest {
-            thread_id,
-            provider_thread_id: thread.provider_thread_id.clone(),
-            cwd: thread.cwd.clone(),
+        Some(HarnessTurnInput {
             input: text,
             model: self.selected_model.clone(),
             reasoning_effort: self.selected_reasoning_effort.clone(),
@@ -675,6 +717,7 @@ impl AgentsSurface {
     pub(crate) fn restore_threads(&mut self, groups: Vec<SerializedThreadGroup>) {
         self.threads_by_path.clear();
         self.active_thread_by_path.clear();
+        self.codex_sessions.clear();
         let mut max_thread_number: usize = 0;
 
         for group in groups {

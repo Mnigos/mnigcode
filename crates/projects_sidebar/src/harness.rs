@@ -5,7 +5,10 @@ use futures::{
 };
 use gpui::SharedString;
 use serde_json::{Value, json};
-use smol::{channel::Sender, process::Command};
+use smol::{
+    channel::{Receiver, Sender},
+    process::Command,
+};
 use std::{path::PathBuf, process::Stdio};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -49,10 +52,17 @@ pub enum HarnessSandboxPolicy {
 }
 
 #[derive(Clone, Debug)]
-pub struct HarnessTurnRequest {
+pub struct HarnessSessionConfig {
     pub thread_id: HarnessThreadId,
     pub provider_thread_id: Option<String>,
     pub cwd: PathBuf,
+    pub model: String,
+    pub approval_policy: HarnessApprovalPolicy,
+    pub sandbox_policy: HarnessSandboxPolicy,
+}
+
+#[derive(Clone, Debug)]
+pub struct HarnessTurnInput {
     pub input: String,
     pub model: String,
     pub reasoning_effort: String,
@@ -108,15 +118,16 @@ pub enum HarnessToolPhase {
     End,
 }
 
-pub async fn run_codex_app_server_turn(
-    request: HarnessTurnRequest,
+pub async fn run_codex_app_server_session(
+    config: HarnessSessionConfig,
+    turns: Receiver<HarnessTurnInput>,
     updates: Sender<HarnessTurnUpdate>,
 ) {
-    if let Err(error) = run_codex_app_server_turn_impl(request.clone(), updates.clone()).await {
+    if let Err(error) = run_codex_app_server_session_impl(config.clone(), turns, &updates).await {
         send_update(
             &updates,
             HarnessTurnUpdate::Failed {
-                thread_id: request.thread_id,
+                thread_id: config.thread_id,
                 message: error.to_string().into(),
             },
         )
@@ -124,13 +135,14 @@ pub async fn run_codex_app_server_turn(
     }
 }
 
-async fn run_codex_app_server_turn_impl(
-    request: HarnessTurnRequest,
-    updates: Sender<HarnessTurnUpdate>,
+async fn run_codex_app_server_session_impl(
+    config: HarnessSessionConfig,
+    turns: Receiver<HarnessTurnInput>,
+    updates: &Sender<HarnessTurnUpdate>,
 ) -> Result<()> {
     send_status(
-        &updates,
-        request.thread_id.clone(),
+        updates,
+        config.thread_id.clone(),
         HarnessRunStatus::Connecting,
     )
     .await;
@@ -138,7 +150,7 @@ async fn run_codex_app_server_turn_impl(
     let mut command = Command::new("codex");
     command
         .arg("app-server")
-        .current_dir(&request.cwd)
+        .current_dir(&config.cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -147,7 +159,7 @@ async fn run_codex_app_server_turn_impl(
     let mut child = command.spawn().with_context(|| {
         format!(
             "failed to start `codex app-server` in {}",
-            request.cwd.display()
+            config.cwd.display()
         )
     })?;
 
@@ -165,7 +177,7 @@ async fn run_codex_app_server_turn_impl(
         .context("codex app-server stderr was not available")?;
 
     smol::spawn(forward_stderr(
-        request.thread_id.clone(),
+        config.thread_id.clone(),
         stderr,
         updates.clone(),
     ))
@@ -173,7 +185,7 @@ async fn run_codex_app_server_turn_impl(
 
     let mut writer = BufWriter::new(stdin);
     let mut reader = BufReader::new(stdout);
-    let mut next_request_id = 1;
+    let mut next_request_id: i64 = 1;
 
     let initialize_id = next_request_id;
     next_request_id += 1;
@@ -196,8 +208,8 @@ async fn run_codex_app_server_turn_impl(
         &mut reader,
         &mut writer,
         initialize_id,
-        &request.thread_id,
-        &updates,
+        &config.thread_id,
+        updates,
     )
     .await?;
 
@@ -212,16 +224,16 @@ async fn run_codex_app_server_turn_impl(
 
     let thread_open_id = next_request_id;
     next_request_id += 1;
-    let thread_open_message = if let Some(provider_thread_id) = request.provider_thread_id.clone() {
+    let thread_open_message = if let Some(provider_thread_id) = config.provider_thread_id.clone() {
         json!({
             "method": "thread/resume",
             "id": thread_open_id,
             "params": {
                 "threadId": provider_thread_id,
-                "cwd": request.cwd.to_string_lossy(),
-                "model": request.model,
-                "approvalPolicy": approval_policy_name(&request.approval_policy),
-                "sandbox": sandbox_policy_name(&request.sandbox_policy),
+                "cwd": config.cwd.to_string_lossy(),
+                "model": config.model,
+                "approvalPolicy": approval_policy_name(&config.approval_policy),
+                "sandbox": sandbox_policy_name(&config.sandbox_policy),
                 "serviceName": "mnig_code",
             },
         })
@@ -230,10 +242,10 @@ async fn run_codex_app_server_turn_impl(
             "method": "thread/start",
             "id": thread_open_id,
             "params": {
-                "cwd": request.cwd.to_string_lossy(),
-                "model": request.model,
-                "approvalPolicy": approval_policy_name(&request.approval_policy),
-                "sandbox": sandbox_policy_name(&request.sandbox_policy),
+                "cwd": config.cwd.to_string_lossy(),
+                "model": config.model,
+                "approvalPolicy": approval_policy_name(&config.approval_policy),
+                "sandbox": sandbox_policy_name(&config.sandbox_policy),
                 "serviceName": "mnig_code",
             },
         })
@@ -243,68 +255,72 @@ async fn run_codex_app_server_turn_impl(
         &mut reader,
         &mut writer,
         thread_open_id,
-        &request.thread_id,
-        &updates,
+        &config.thread_id,
+        updates,
     )
     .await?;
     let provider_thread_id = read_thread_id(&thread_open_result)
-        .or(request.provider_thread_id)
+        .or(config.provider_thread_id.clone())
         .context("codex app-server did not return a thread id")?;
 
     send_update(
-        &updates,
+        updates,
         HarnessTurnUpdate::ThreadReady {
-            thread_id: request.thread_id.clone(),
+            thread_id: config.thread_id.clone(),
             provider_thread_id: provider_thread_id.clone(),
         },
     )
     .await;
-    send_status(
-        &updates,
-        request.thread_id.clone(),
-        HarnessRunStatus::Thinking,
-    )
-    .await;
 
-    let turn_start_id = next_request_id;
-    write_message(
-        &mut writer,
-        json!({
-            "method": "turn/start",
-            "id": turn_start_id,
-            "params": {
-                "threadId": provider_thread_id,
-                "input": [
-                    {
-                        "type": "text",
-                        "text": request.input,
-                    },
-                ],
-                "cwd": request.cwd.to_string_lossy(),
-                "model": request.model,
-                "effort": request.reasoning_effort,
-                "approvalPolicy": approval_policy_name(&request.approval_policy),
-                "sandboxPolicy": sandbox_policy_value(&request.sandbox_policy),
-            },
-        }),
-    )
-    .await?;
-    read_until_response(
-        &mut reader,
-        &mut writer,
-        turn_start_id,
-        &request.thread_id,
-        &updates,
-    )
-    .await?;
-    send_status(
-        &updates,
-        request.thread_id.clone(),
-        HarnessRunStatus::Running,
-    )
-    .await;
+    while let Ok(turn) = turns.recv().await {
+        send_status(
+            updates,
+            config.thread_id.clone(),
+            HarnessRunStatus::Thinking,
+        )
+        .await;
 
-    read_until_turn_finished(&mut reader, &mut writer, &request.thread_id, &updates).await?;
+        let turn_start_id = next_request_id;
+        next_request_id += 1;
+        write_message(
+            &mut writer,
+            json!({
+                "method": "turn/start",
+                "id": turn_start_id,
+                "params": {
+                    "threadId": provider_thread_id,
+                    "input": [
+                        {
+                            "type": "text",
+                            "text": turn.input,
+                        },
+                    ],
+                    "cwd": config.cwd.to_string_lossy(),
+                    "model": turn.model,
+                    "effort": turn.reasoning_effort,
+                    "approvalPolicy": approval_policy_name(&turn.approval_policy),
+                    "sandboxPolicy": sandbox_policy_value(&turn.sandbox_policy),
+                },
+            }),
+        )
+        .await?;
+        read_until_response(
+            &mut reader,
+            &mut writer,
+            turn_start_id,
+            &config.thread_id,
+            updates,
+        )
+        .await?;
+        send_status(
+            updates,
+            config.thread_id.clone(),
+            HarnessRunStatus::Running,
+        )
+        .await;
+
+        read_until_turn_finished(&mut reader, &mut writer, &config.thread_id, updates).await?;
+    }
 
     child.kill().ok();
     Ok(())
