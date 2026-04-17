@@ -338,9 +338,25 @@ impl AgentsSurface {
             return;
         };
 
-        // Only consume the composer input once we know we have a destination
-        // thread to submit it to. Any failure past this point (e.g. the thread
-        // is already running a turn) surfaces feedback in the transcript.
+        // If the thread is already running a turn, surface a system message
+        // and keep the composer intact so the user can retry after it
+        // finishes rather than losing what they typed.
+        if self
+            .thread_mut(&thread_id)
+            .is_some_and(|thread| thread.run_status.is_active())
+        {
+            if let Some(thread) = self.thread_mut(&thread_id) {
+                thread.messages.push(TranscriptMessage {
+                    role: TranscriptRole::System,
+                    text:
+                        "Agent is already working on this thread. Please wait for this turn to finish."
+                            .to_string(),
+                });
+            }
+            cx.notify();
+            return;
+        }
+
         self.composer_editor.update(cx, |editor, cx| {
             editor.clear(window, cx);
         });
