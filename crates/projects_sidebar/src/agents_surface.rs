@@ -305,7 +305,7 @@ impl AgentsSurface {
                     for message in thread.messages.iter_mut() {
                         if let TranscriptRole::Tool { status, .. } = &mut message.role {
                             if *status == ToolStatus::Running {
-                                *status = ToolStatus::Completed;
+                                *status = ToolStatus::Failed;
                             }
                         }
                     }
