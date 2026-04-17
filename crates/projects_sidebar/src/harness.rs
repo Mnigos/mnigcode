@@ -349,14 +349,16 @@ where
             bail!("codex app-server exited before the turn completed");
         };
 
-        if let Some(method) = message.get("method").and_then(Value::as_str)
-            && method == "turn/completed"
-        {
-            handle_protocol_message(message, writer, thread_id, updates, None).await?;
-            return Ok(());
-        }
+        let is_turn_completed = matches!(
+            message.get("method").and_then(Value::as_str),
+            Some("turn/completed")
+        );
 
         handle_protocol_message(message, writer, thread_id, updates, None).await?;
+
+        if is_turn_completed {
+            return Ok(());
+        }
     }
 }
 
@@ -371,12 +373,14 @@ where
     Writer: AsyncWrite + Unpin,
 {
     if let Some(method) = message.get("method").and_then(Value::as_str) {
+        // Dispatch notifications first so method-driven updates (e.g.
+        // turn/completed → Finished) are emitted even when the server sends
+        // the method as a request that also requires a response.
+        handle_notification(method, message.get("params"), thread_id, updates).await;
+
         if let Some(request_id) = message.get("id").cloned() {
             respond_to_server_request(writer, request_id, method).await?;
-            return Ok(None);
         }
-
-        handle_notification(method, message.get("params"), thread_id, updates).await;
         return Ok(None);
     }
 
