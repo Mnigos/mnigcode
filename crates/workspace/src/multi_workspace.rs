@@ -151,6 +151,14 @@ pub trait Sidebar: Focusable + Render + EventEmitter<SidebarEvent> + Sized {
     /// Switches between Editor and Agents workspace modes.
     fn toggle_workspace_mode(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
 
+    /// Starts a new thread in the currently active project.
+    fn new_thread_in_active_project(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+    }
+
     /// Return an opaque JSON blob of sidebar-specific state to persist.
     fn serialized_state(&self, _cx: &App) -> Option<String> {
         None
@@ -180,6 +188,7 @@ pub trait SidebarHandle: 'static + Send + Sync {
     fn cycle_project(&self, forward: bool, window: &mut Window, cx: &mut App);
     fn cycle_thread(&self, forward: bool, window: &mut Window, cx: &mut App);
     fn toggle_workspace_mode(&self, window: &mut Window, cx: &mut App);
+    fn new_thread_in_active_project(&self, window: &mut Window, cx: &mut App);
 
     fn is_threads_list_view_active(&self, cx: &App) -> bool;
 
@@ -267,6 +276,15 @@ impl<T: Sidebar> SidebarHandle for Entity<T> {
         window.defer(cx, move |window, cx| {
             entity.update(cx, |this, cx| {
                 this.toggle_workspace_mode(window, cx);
+            });
+        });
+    }
+
+    fn new_thread_in_active_project(&self, window: &mut Window, cx: &mut App) {
+        let entity = self.clone();
+        window.defer(cx, move |window, cx| {
+            entity.update(cx, |this, cx| {
+                this.new_thread_in_active_project(window, cx);
             });
         });
     }
@@ -1931,6 +1949,13 @@ impl Render for MultiWorkspace {
                         |this: &mut Self, _: &ToggleWorkspaceMode, window, cx| {
                             if let Some(sidebar) = &this.sidebar {
                                 sidebar.toggle_workspace_mode(window, cx);
+                            }
+                        },
+                    ))
+                    .on_action(cx.listener(
+                        |this: &mut Self, _: &NewThread, window, cx| {
+                            if let Some(sidebar) = &this.sidebar {
+                                sidebar.new_thread_in_active_project(window, cx);
                             }
                         },
                     ))

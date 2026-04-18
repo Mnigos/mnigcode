@@ -549,6 +549,17 @@ impl workspace::Sidebar for ProjectsSidebar {
         self.set_mode(next, window, cx);
     }
 
+    fn new_thread_in_active_project(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = self.active_workspace(cx) else {
+            return;
+        };
+        self.start_thread(workspace, window, cx);
+    }
+
     fn top_bar_view(&self, _cx: &App) -> Option<AnyView> {
         Some(self.mode_switcher.clone().into())
     }

@@ -520,6 +520,7 @@
       "alt-r": "search::ToggleRegex",
       "ctrl-k shift-enter": "pane::TogglePinTab",
       "ctrl-alt-m": "multi_workspace::ToggleWorkspaceMode",
+      "ctrl-alt-n": "multi_workspace::NewThread",
     },
   },
   // Bindings from VS Code
@@ -527,6 +528,7 @@
     "context": "Editor",
     "bindings": {
       "ctrl-alt-m": "multi_workspace::ToggleWorkspaceMode",
+      "ctrl-alt-n": "multi_workspace::NewThread",
       "ctrl-[": "editor::Outdent",
       "ctrl-]": "editor::Indent",
       "shift-alt-up": ["editor::AddSelectionAbove", { "skip_soft_wrap": true }], // Insert Cursor Above
@@ -654,6 +656,7 @@
       "ctrl-alt-j": "multi_workspace::ToggleWorkspaceSidebar",
       "ctrl-alt-;": "multi_workspace::FocusWorkspaceSidebar",
       "ctrl-alt-m": "multi_workspace::ToggleWorkspaceMode",
+      "ctrl-alt-n": "multi_workspace::NewThread",
       "ctrl-alt-y": "workspace::ToggleAllDocks",
       "ctrl-alt-0": "workspace::ResetActiveDockSize",
       // For 0px parameter, uses UI font size value.
