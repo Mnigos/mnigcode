@@ -9,6 +9,7 @@ mod transcript;
 use editor;
 use gpui::{App, KeyBinding};
 use menu::Confirm;
+use workspace::{NewThread, ToggleWorkspaceMode};
 
 pub use sidebar_view::ProjectsSidebar;
 
@@ -22,5 +23,10 @@ pub fn init(cx: &mut App) {
             editor::actions::Newline,
             Some("AgentComposer > Editor"),
         ),
+        // Register without a context predicate so the shortcuts match
+        // regardless of which focusable element is currently active. The
+        // action itself still routes up to the MultiWorkspace handler.
+        KeyBinding::new("ctrl-alt-m", ToggleWorkspaceMode, None),
+        KeyBinding::new("ctrl-alt-n", NewThread, None),
     ]);
 }
