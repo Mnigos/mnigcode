@@ -11,6 +11,15 @@ pub(crate) enum WorkspaceMode {
     Agents,
 }
 
+impl WorkspaceMode {
+    pub(crate) fn toggled(self) -> Self {
+        match self {
+            WorkspaceMode::Editor => WorkspaceMode::Agents,
+            WorkspaceMode::Agents => WorkspaceMode::Editor,
+        }
+    }
+}
+
 pub struct WorkspaceModeSwitcher {
     sidebar: WeakEntity<ProjectsSidebar>,
 }

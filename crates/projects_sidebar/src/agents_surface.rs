@@ -139,6 +139,21 @@ fn resolve_agent_link(
     None
 }
 
+fn should_skip_message(message: &TranscriptMessage) -> bool {
+    // Hide reasoning tool blocks that ended with no body: codex omits
+    // reasoning summaries for many model/effort combos, and rendering an
+    // empty "Thought" row is just noise.
+    match &message.role {
+        TranscriptRole::Tool {
+            kind: ToolDisplayKind::Reasoning,
+            status,
+            ..
+        } if *status != ToolStatus::Running && message.text.trim().is_empty() => true,
+        TranscriptRole::Assistant if message.text.is_empty() => true,
+        _ => false,
+    }
+}
+
 fn should_show_role_header(
     index: usize,
     message: &TranscriptMessage,
@@ -198,6 +213,10 @@ pub struct AgentsSurface {
     expanded_tool_messages: HashSet<(SharedString, usize)>,
     markdown_cache: HashMap<(SharedString, usize), (SharedString, Entity<Markdown>)>,
     transcript_scroll_handle: ScrollHandle,
+    /// When true, new transcript content pins the scroll position to the
+    /// bottom. Turns off once the user scrolls up and re-engages when they
+    /// return to the bottom.
+    stick_to_bottom: bool,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -246,6 +265,7 @@ impl AgentsSurface {
             expanded_tool_messages: HashSet::new(),
             markdown_cache: HashMap::new(),
             transcript_scroll_handle: ScrollHandle::new(),
+            stick_to_bottom: true,
             _subscriptions: vec![active_workspace_subscription],
         }
     }
@@ -484,6 +504,11 @@ impl AgentsSurface {
         let attachments = std::mem::take(&mut self.pending_attachments);
         let combined_input = build_input_with_attachments(&text, &attachments);
 
+        // Sending a new message re-engages autoscroll so the user always sees
+        // their own turn land at the bottom even if they were scrolled up to
+        // reread earlier context.
+        self.stick_to_bottom = true;
+
         let Some(turn_input) = self.prepare_turn_input(thread_id.clone(), combined_input, cx)
         else {
             return;
@@ -590,10 +615,6 @@ impl AgentsSurface {
         thread.messages.push(TranscriptMessage {
             role: TranscriptRole::User,
             text: text.clone(),
-        });
-        thread.messages.push(TranscriptMessage {
-            role: TranscriptRole::Assistant,
-            text: String::new(),
         });
         thread.run_status = HarnessRunStatus::Connecting;
         cx.notify();
@@ -1051,7 +1072,6 @@ impl Render for AgentsSurface {
                     .pb_5()
                     .gap_2()
                     .child(self.render_composer(cx))
-                    .children(self.render_context_bar(cx))
                     .child(self.render_run_controls(cx)),
             )
             .children(preview_overlay)
@@ -1066,9 +1086,32 @@ impl AgentsSurface {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // Decide whether to keep the transcript pinned to the bottom. GPUI
+        // applies wheel deltas to the scroll offset before invoking our
+        // re-render, so the offset we read here already reflects the user's
+        // latest scroll position.
+        //
+        // - If the user was being auto-scrolled and has now scrolled up, drop
+        //   out of stick mode so we don't fight their input.
+        // - If they scroll back to the bottom, re-engage stick mode so new
+        //   messages keep appearing without extra clicks.
+        let offset_y = self.transcript_scroll_handle.offset().y;
+        let max_offset_y = self.transcript_scroll_handle.max_offset().y;
+        let at_bottom =
+            max_offset_y <= px(0.0) || (offset_y + max_offset_y).abs() <= px(4.0);
+        if self.stick_to_bottom != at_bottom {
+            self.stick_to_bottom = at_bottom;
+        }
+        if self.stick_to_bottom {
+            self.transcript_scroll_handle.scroll_to_bottom();
+        }
+
         let thread_id = thread.id.0.clone();
         let mut messages = Vec::new();
         for (index, message) in thread.messages.iter().enumerate() {
+            if should_skip_message(message) {
+                continue;
+            }
             let show_header = should_show_role_header(index, message, &thread.messages);
             messages.push(self.render_message(
                 thread_id.clone(),
@@ -1403,18 +1446,6 @@ impl AgentsSurface {
                     .text_color(Color::Muted.color(cx))
                     .child(SharedString::from("Waiting for output…"))
                     .into_any_element()
-            } else if is_reasoning {
-                div()
-                    .ml(px(20.0))
-                    .px_3()
-                    .py_2()
-                    .text_sm()
-                    .text_color(Color::Muted.color(cx))
-                    .italic()
-                    .child(SharedString::from(
-                        "No reasoning summary emitted by codex for this turn.",
-                    ))
-                    .into_any_element()
             } else {
                 div().into_any_element()
             };
@@ -1629,6 +1660,7 @@ impl AgentsSurface {
                     .child(self.render_model_selector(cx))
                     .child(self.render_reasoning_selector(cx))
                     .child(div().flex_1())
+                    .children(self.render_context_indicator(cx))
                     .child(
                         IconButton::new("agent-composer-mic", IconName::Mic)
                             .icon_size(IconSize::Small)
@@ -1943,7 +1975,7 @@ impl AgentsSurface {
             })
     }
 
-    fn render_context_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_context_indicator(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let thread = self.active_thread(cx)?;
         if thread.estimated_tokens_used == 0 {
             return None;
@@ -1951,9 +1983,10 @@ impl AgentsSurface {
 
         let max_tokens = model_context_window(&self.selected_model) as f32;
         let used = thread.estimated_tokens_used as f32;
-        let percentage = ((used / max_tokens) * 100.0).min(100.0) as u32;
-        let is_estimate = !thread.has_reported_tokens;
-        let prefix = if is_estimate { "~" } else { "" };
+        let ratio = (used / max_tokens).clamp(0.0, 1.0);
+        // Round up so that the moment the user spends any tokens, the bar
+        // advertises at least 1%. Zero is only shown when the thread is empty.
+        let percentage = (ratio * 100.0).ceil().min(100.0) as u32;
         let used_label = format_token_count(thread.estimated_tokens_used);
         let max_label = format_token_count(model_context_window(&self.selected_model));
         let bar_color = if percentage >= 85 {
@@ -1961,30 +1994,25 @@ impl AgentsSurface {
         } else {
             cx.theme().status().info
         };
-        let tooltip_text = if is_estimate {
-            format!(
-                "~{percentage}% context used (estimated {used_label} / {max_label} tokens)"
-            )
-        } else {
-            format!("{percentage}% context used ({used_label} / {max_label} tokens)")
-        };
+        // Ensure the progress arc is visually perceptible even when usage is
+        // still a tiny fraction of the window (new threads, first tokens).
+        let display_value = (ratio.max(0.03) * max_tokens).min(max_tokens);
+        let tooltip_text =
+            format!("{percentage}% context used ({used_label} / {max_label} tokens)");
 
         Some(
             h_flex()
-                .id("agent-context-bar")
-                .w(COMPOSER_WIDTH)
-                .px_2()
-                .gap_2()
+                .id("agent-context-indicator")
+                .gap_1p5()
                 .items_center()
-                .justify_end()
                 .tooltip(Tooltip::text(tooltip_text))
                 .child(
-                    CircularProgress::new(used, max_tokens, px(14.0), cx)
+                    CircularProgress::new(display_value, max_tokens, px(14.0), cx)
                         .stroke_width(px(2.0))
                         .progress_color(bar_color),
                 )
                 .child(
-                    Label::new(format!("{prefix}{used_label} / {max_label}"))
+                    Label::new(format!("{used_label} / {max_label}"))
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 )
