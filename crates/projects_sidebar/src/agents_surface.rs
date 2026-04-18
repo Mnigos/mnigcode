@@ -517,12 +517,11 @@ impl AgentsSurface {
             .is_some_and(|thread| thread.run_status.is_active())
         {
             if let Some(thread) = self.thread_mut(&thread_id) {
-                thread.messages.push(TranscriptMessage {
-                    role: TranscriptRole::System,
-                    text:
-                        "Agent is already working on this thread. Please wait for this turn to finish."
-                            .to_string(),
-                });
+                thread.messages.push(TranscriptMessage::new(
+                    TranscriptRole::System,
+                    "Agent is already working on this thread. Please wait for this turn to finish."
+                        .to_string(),
+                ));
             }
             cx.notify();
             return;
@@ -532,14 +531,14 @@ impl AgentsSurface {
             editor.clear(window, cx);
         });
         let attachments = std::mem::take(&mut self.pending_attachments);
-        let combined_input = build_input_with_attachments(&text, &attachments);
 
         // Sending a new message re-engages autoscroll so the user always sees
         // their own turn land at the bottom even if they were scrolled up to
         // reread earlier context.
         self.stick_to_bottom = true;
 
-        let Some(turn_input) = self.prepare_turn_input(thread_id.clone(), combined_input, cx)
+        let Some(turn_input) =
+            self.prepare_turn_input(thread_id.clone(), text, attachments, cx)
         else {
             return;
         };
@@ -550,10 +549,10 @@ impl AgentsSurface {
         if session_sender.try_send(turn_input).is_err() {
             if let Some(thread) = self.thread_mut(&thread_id) {
                 thread.run_status = HarnessRunStatus::Failed("codex session closed".into());
-                thread.messages.push(TranscriptMessage {
-                    role: TranscriptRole::System,
-                    text: "Agent session closed unexpectedly. Please try again.".to_string(),
-                });
+                thread.messages.push(TranscriptMessage::new(
+                    TranscriptRole::System,
+                    "Agent session closed unexpectedly. Please try again.".to_string(),
+                ));
             }
             self.codex_sessions.remove(&thread_id);
         }
@@ -621,12 +620,23 @@ impl AgentsSurface {
         &mut self,
         thread_id: HarnessThreadId,
         text: String,
+        attachments: Vec<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Option<HarnessTurnInput> {
         let thread = self.thread_mut(&thread_id)?;
 
         if thread.messages.is_empty() {
-            thread.title = text
+            let attachment_fallback = attachments
+                .first()
+                .map(|first| attachment_display_name(first).to_string());
+            let title_source: &str = if !text.is_empty() {
+                text.as_str()
+            } else if let Some(fallback) = attachment_fallback.as_deref() {
+                fallback
+            } else {
+                "New thread"
+            };
+            thread.title = title_source
                 .lines()
                 .next()
                 .unwrap_or("New thread")
@@ -636,21 +646,24 @@ impl AgentsSurface {
                 .into();
         }
 
+        let combined_input = build_input_with_attachments(&text, &attachments);
+
         // Pre-turn estimate is only used until codex reports real usage via
         // turn/completed; once we have real numbers we stop accumulating
         // guesses.
         if !thread.has_reported_tokens {
-            thread.estimated_tokens_used += text.len() / 4;
+            thread.estimated_tokens_used += combined_input.len() / 4;
         }
         thread.messages.push(TranscriptMessage {
             role: TranscriptRole::User,
-            text: text.clone(),
+            text,
+            attachments,
         });
         thread.run_status = HarnessRunStatus::Connecting;
         cx.notify();
 
         Some(HarnessTurnInput {
-            input: text,
+            input: combined_input,
             model: self.selected_model.clone(),
             reasoning_effort: self.selected_reasoning_effort.clone(),
             approval_policy: HarnessApprovalPolicy::Never,
@@ -685,10 +698,9 @@ impl AgentsSurface {
                         Some(message) if matches!(message.role, TranscriptRole::Assistant) => {
                             message.text.push_str(&delta);
                         }
-                        _ => thread.messages.push(TranscriptMessage {
-                            role: TranscriptRole::Assistant,
-                            text: delta,
-                        }),
+                        _ => thread
+                            .messages
+                            .push(TranscriptMessage::new(TranscriptRole::Assistant, delta)),
                     }
                 }
             }
@@ -772,15 +784,15 @@ impl AgentsSurface {
                             HarnessToolPhase::End => ToolStatus::Completed,
                             _ => ToolStatus::Running,
                         };
-                        thread.messages.push(TranscriptMessage {
-                            role: TranscriptRole::Tool {
+                        thread.messages.push(TranscriptMessage::new(
+                            TranscriptRole::Tool {
                                 item_id: item_id.clone(),
                                 kind: display_kind,
                                 status,
                                 title,
                             },
-                            text: detail.to_string(),
-                        });
+                            detail.to_string(),
+                        ));
                     }
                 }
             }
@@ -815,10 +827,10 @@ impl AgentsSurface {
                             }
                         }
                     }
-                    thread.messages.push(TranscriptMessage {
-                        role: TranscriptRole::System,
-                        text: format!("Agent failed: {message}"),
-                    });
+                    thread.messages.push(TranscriptMessage::new(
+                        TranscriptRole::System,
+                        format!("Agent failed: {message}"),
+                    ));
                 }
             }
         }
@@ -848,10 +860,10 @@ impl AgentsSurface {
             } else {
                 log::warn!("no file in project matched link: {url}");
                 if let Some(thread) = self.active_thread_mut(cx) {
-                    thread.messages.push(TranscriptMessage {
-                        role: TranscriptRole::System,
-                        text: format!("Could not find file for link: {url}"),
-                    });
+                    thread.messages.push(TranscriptMessage::new(
+                        TranscriptRole::System,
+                        format!("Could not find file for link: {url}"),
+                    ));
                     cx.notify();
                 }
             }
@@ -956,6 +968,7 @@ impl AgentsSurface {
                                         },
                                     },
                                     text: message.text.clone(),
+                                    attachments: message.attachments.clone(),
                                 })
                                 .collect(),
                             estimated_tokens: Some(thread.estimated_tokens_used),
@@ -1006,6 +1019,7 @@ impl AgentsSurface {
                             },
                         },
                         text: message.text,
+                        attachments: message.attachments,
                     })
                     .collect();
 
@@ -1251,9 +1265,15 @@ impl AgentsSurface {
                 TranscriptRole::Tool { .. } => unreachable!(),
             };
 
-        let body: AnyElement = if is_assistant && !message.text.is_empty() {
+        let skip_body = matches!(message.role, TranscriptRole::User)
+            && message.text.is_empty()
+            && !message.attachments.is_empty();
+
+        let body: AnyElement = if skip_body {
+            div().into_any_element()
+        } else if is_assistant && !message.text.is_empty() {
             let source: SharedString = message.text.clone().into();
-            let cache_key = (thread_id, index);
+            let cache_key = (thread_id.clone(), index);
             let markdown_entity = reset_or_create_markdown(
                 &mut self.markdown_cache,
                 cache_key,
@@ -1294,6 +1314,19 @@ impl AgentsSurface {
                 .into_any_element()
         };
 
+        let attachments_row = if matches!(message.role, TranscriptRole::User)
+            && !message.attachments.is_empty()
+        {
+            Some(self.render_message_attachments(
+                &thread_id,
+                index,
+                &message.attachments,
+                cx,
+            ))
+        } else {
+            None
+        };
+
         v_flex()
             .id(("harness-message", index))
             .w_full()
@@ -1304,6 +1337,7 @@ impl AgentsSurface {
             .when(show_header, |this| {
                 this.child(Label::new(label).size(LabelSize::Small).color(label_color))
             })
+            .children(attachments_row)
             .child(body)
             .into_any_element()
     }
@@ -1809,8 +1843,89 @@ impl AgentsSurface {
             .into_any_element()
     }
 
+    fn render_message_attachments(
+        &self,
+        thread_id: &SharedString,
+        message_index: usize,
+        attachments: &[PathBuf],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let previews: Vec<AnyElement> = attachments
+            .iter()
+            .enumerate()
+            .map(|(attachment_index, path)| {
+                let display_name = attachment_display_name(path);
+                let full_path: SharedString = path.to_string_lossy().to_string().into();
+                let is_image = is_image_path(path);
+                let element_id = SharedString::from(format!(
+                    "message-attachment-{}-{}-{}",
+                    thread_id, message_index, attachment_index
+                ));
+                let element_id = ElementId::Name(element_id);
+                let clickable_path = path.clone();
+
+                if is_image {
+                    h_flex()
+                        .id(element_id)
+                        .w(px(96.0))
+                        .h(px(96.0))
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .cursor_pointer()
+                        .tooltip(Tooltip::text(full_path))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.preview_attachment(clickable_path.clone(), cx);
+                        }))
+                        .child(
+                            img(path.clone())
+                                .object_fit(ObjectFit::Cover)
+                                .w_full()
+                                .h_full(),
+                        )
+                        .into_any_element()
+                } else {
+                    h_flex()
+                        .id(element_id)
+                        .h(px(28.0))
+                        .gap_1p5()
+                        .px_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .bg(colors.element_background)
+                        .items_center()
+                        .tooltip(Tooltip::text(full_path))
+                        .child(
+                            Icon::new(attachment_icon(path))
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(display_name)
+                                .size(LabelSize::Small)
+                                .color(Color::Default)
+                                .truncate(),
+                        )
+                        .into_any_element()
+                }
+            })
+            .collect();
+
+        h_flex()
+            .gap_2()
+            .flex_wrap()
+            .children(previews)
+            .into_any_element()
+    }
+
     fn render_drop_overlay(&self, cx: &mut Context<Self>) -> AnyElement {
-        let drop_target_background = cx.theme().colors().drop_target_background;
+        // Fully opaque fill so the composer's contents are clearly replaced by
+        // the drop prompt — a subtle tint behind input text is easy to miss.
+        let overlay_background = cx.theme().colors().element_selected;
         let border_focused = cx.theme().colors().border_focused;
         div()
             .invisible()
@@ -1818,22 +1933,23 @@ impl AgentsSurface {
             .inset_0()
             .size_full()
             .rounded_xl()
-            .bg(drop_target_background)
+            .bg(overlay_background)
             .border_2()
             .border_color(border_focused)
             .flex()
+            .flex_col()
             .items_center()
             .justify_center()
-            .gap_2()
+            .gap_1()
             .drag_over::<ExternalPaths>(|this, _, _, _| this.visible())
             .child(
-                Icon::new(IconName::Plus)
-                    .size(IconSize::Small)
+                Icon::new(IconName::Download)
+                    .size(IconSize::Medium)
                     .color(Color::Accent),
             )
             .child(
                 Label::new("Drop files here to attach")
-                    .size(LabelSize::Small)
+                    .size(LabelSize::Default)
                     .color(Color::Accent),
             )
             .into_any_element()
