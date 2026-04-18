@@ -706,24 +706,32 @@ fn extract_tool_detail(
 
     // For commands, only put stdout/output in the detail — the command itself
     // lives in the title ("Run command: ...") and the renderer extracts it
-    // from there, so duplicating it here causes the "$ cmd" line to appear
-    // twice. On "completed" events the server re-sends the full item with
-    // the command in "output" — skip that to avoid triple-rendering.
+    // from there, so duplicating it into the body would produce a "$ cmd"
+    // line twice. Output arrives either as a running stream of `delta`s or
+    // (more commonly) as a single `aggregated_output`/`output` snapshot on
+    // the completion event.
     if matches!(kind, HarnessToolKind::Command) {
-        if matches!(
-            phase_str,
-            "completed" | "end" | "ended" | "complete" | "finished"
-        ) {
-            return SharedString::default();
-        }
-        if let Some(output) = lookup("output")
+        let command_text = command_string(params, item_payload);
+
+        if let Some(snapshot) = lookup("aggregated_output")
+            .or_else(|| lookup("aggregatedOutput"))
+            .or_else(|| lookup("output"))
             .or_else(|| lookup("stdout"))
         {
-            return output.into();
+            // Some servers echo the command itself back in `output`. Strip it
+            // so the transcript doesn't render the command line twice.
+            if let Some(command_text) = command_text.as_deref()
+                && snapshot.trim() == command_text.trim()
+            {
+                return SharedString::default();
+            }
+            return snapshot.into();
         }
         if let Some(delta) = lookup("delta") {
             return delta.into();
         }
+        // Nothing useful on a pure "completed" event with no output field.
+        let _ = phase_str;
         return SharedString::default();
     }
 

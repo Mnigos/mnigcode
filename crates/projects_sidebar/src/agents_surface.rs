@@ -759,19 +759,26 @@ impl AgentsSurface {
                             };
                         }
                         if !detail.is_empty() {
-                            if matches!(display_kind, ToolDisplayKind::Reasoning) {
-                                // Codex reasoning can be sent either as pure
-                                // deltas or as cumulative snapshots. If the
-                                // new detail already contains what we have,
-                                // treat it as a snapshot and replace; else
-                                // append as a delta.
-                                if detail.as_ref().starts_with(message.text.as_str())
-                                    && detail.len() >= message.text.len()
-                                {
-                                    message.text = detail.to_string();
-                                } else {
-                                    message.text.push_str(&detail);
-                                }
+                            // Codex can ship tool bodies either as pure deltas
+                            // or as cumulative snapshots. Reasoning frequently
+                            // arrives as rolling snapshots; command output
+                            // typically arrives as a single completion-time
+                            // snapshot after any streamed deltas. In both
+                            // cases, if the new payload already contains the
+                            // existing body, treat it as a snapshot and
+                            // replace rather than double-append; otherwise
+                            // treat it as a delta.
+                            let use_snapshot_merge = matches!(
+                                display_kind,
+                                ToolDisplayKind::Reasoning | ToolDisplayKind::Command
+                            );
+                            if use_snapshot_merge
+                                && detail.as_ref().starts_with(message.text.as_str())
+                                && detail.len() >= message.text.len()
+                            {
+                                message.text = detail.to_string();
+                            } else if matches!(display_kind, ToolDisplayKind::Reasoning) {
+                                message.text.push_str(&detail);
                             } else {
                                 if !message.text.is_empty() {
                                     message.text.push('\n');
