@@ -1011,6 +1011,7 @@ impl AgentsSurface {
                                 })
                                 .collect(),
                             estimated_tokens: Some(thread.estimated_tokens_used),
+                            has_reported_tokens: thread.has_reported_tokens,
                         })
                         .collect(),
                 })
@@ -1073,7 +1074,7 @@ impl AgentsSurface {
                     run_status: HarnessRunStatus::Idle,
                     messages,
                     estimated_tokens_used: serialized.estimated_tokens.unwrap_or(0),
-                    has_reported_tokens: serialized.estimated_tokens.is_some(),
+                    has_reported_tokens: serialized.has_reported_tokens,
                 });
             }
 
@@ -1401,10 +1402,6 @@ impl AgentsSurface {
         let expanded = self.expanded_tool_messages.contains(&key);
         let has_body = !body.trim().is_empty();
         let is_running = status == ToolStatus::Running;
-        // An empty reasoning block that the server never fills in (Codex
-        // routinely emits reasoning items with no summary/content) has
-        // nothing to show on expand, so don't invite the click.
-        let empty_reasoning = is_reasoning && !is_running && !has_body;
         let is_expandable = match kind {
             ToolDisplayKind::Reasoning => has_body || is_running,
             ToolDisplayKind::Command => true,
@@ -1436,15 +1433,9 @@ impl AgentsSurface {
             if status == ToolStatus::Running {
                 animated_thinking_label().into_any_element()
             } else {
-                let label_text: SharedString = match (empty_reasoning, duration_ms) {
-                    (true, Some(ms)) => {
-                        format!("Thought for {}", format_thinking_duration(ms)).into()
-                    }
-                    (_, Some(ms)) => {
-                        format!("Thought for {}", format_thinking_duration(ms)).into()
-                    }
-                    (true, None) => "Thought".into(),
-                    (false, None) => "Thought".into(),
+                let label_text: SharedString = match duration_ms {
+                    Some(ms) => format!("Thought for {}", format_thinking_duration(ms)).into(),
+                    None => "Thought".into(),
                 };
                 Label::new(label_text)
                     .size(LabelSize::Small)
