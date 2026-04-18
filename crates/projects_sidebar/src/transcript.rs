@@ -30,6 +30,17 @@ pub struct HarnessThreadSummary {
 pub(crate) struct TranscriptMessage {
     pub(crate) role: TranscriptRole,
     pub(crate) text: String,
+    pub(crate) attachments: Vec<PathBuf>,
+}
+
+impl TranscriptMessage {
+    pub(crate) fn new(role: TranscriptRole, text: String) -> Self {
+        Self {
+            role,
+            text,
+            attachments: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone)]

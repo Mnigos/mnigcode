@@ -43,6 +43,8 @@ pub(crate) struct SerializedHarnessThread {
 pub(crate) struct SerializedTranscriptMessage {
     pub(crate) role: SerializedTranscriptRole,
     pub(crate) text: String,
+    #[serde(default)]
+    pub(crate) attachments: Vec<PathBuf>,
 }
 
 #[derive(Deserialize, Serialize)]
