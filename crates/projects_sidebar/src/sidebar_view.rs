@@ -563,6 +563,12 @@ impl workspace::Sidebar for ProjectsSidebar {
             selected_reasoning_effort: Some(
                 agents_surface.selected_reasoning_effort().to_string(),
             ),
+            selected_sandbox_policy: Some(
+                agents_surface
+                    .selected_sandbox_policy()
+                    .serialization_key()
+                    .to_string(),
+            ),
         };
         serde_json::to_string(&serialized).ok()
     }
@@ -581,6 +587,7 @@ impl workspace::Sidebar for ProjectsSidebar {
                     next_thread_number,
                     selected_model,
                     selected_reasoning_effort,
+                    selected_sandbox_policy,
                 } = serialized;
                 self.mode = mode;
                 self.agents_surface.update(cx, |agents_surface, _| {
@@ -591,6 +598,12 @@ impl workspace::Sidebar for ProjectsSidebar {
                     }
                     if let Some(effort) = selected_reasoning_effort {
                         agents_surface.set_selected_reasoning_effort(effort);
+                    }
+                    if let Some(policy) = selected_sandbox_policy
+                        && let Some(policy) =
+                            crate::harness::HarnessSandboxPolicy::from_serialization_key(&policy)
+                    {
+                        agents_surface.set_selected_sandbox_policy(policy);
                     }
                 });
                 cx.defer_in(window, move |this, window, cx| {
