@@ -35,6 +35,22 @@ pub(crate) fn workspace_root_path(
         .map(|path| path.as_ref().to_path_buf())
 }
 
+pub(crate) fn url_has_scheme(url: &str) -> bool {
+    // Treat anything with a `scheme://` prefix or a `mailto:`/`tel:`-style
+    // prefix as an actual URL. Bare paths like `WebViewSupport.cpp` should
+    // not be handed to the OS `open` command.
+    if let Some((scheme, _)) = url.split_once(':') {
+        !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+            && !scheme.contains('/')
+            && scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+    } else {
+        false
+    }
+}
+
 pub(crate) fn workspace_storage_key(
     workspace: &Entity<workspace::Workspace>,
     cx: &App,

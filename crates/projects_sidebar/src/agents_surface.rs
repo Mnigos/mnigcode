@@ -1,8 +1,8 @@
 use editor::Editor;
 use gpui::{
-    AnyElement, App, Context, Entity, ExternalPaths, Focusable, MouseButton, ObjectFit,
-    PathPromptOptions, Pixels, Render, ScrollHandle, SharedString, Subscription, Task, Window,
-    deferred, img, px,
+    AnyElement, App, Context, Entity, EventEmitter, ExternalPaths, Focusable, MouseButton,
+    ObjectFit, PathPromptOptions, Pixels, Render, ScrollHandle, SharedString, Subscription, Task,
+    Window, deferred, img, px,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use language::language_settings::SoftWrap;
@@ -13,7 +13,8 @@ use std::{
     path::PathBuf,
 };
 use ui::{
-    CommonAnimationExt, ContextMenu, PopoverMenu, TintColor, Tooltip, WithScrollbar, prelude::*,
+    CircularProgress, CommonAnimationExt, ContextMenu, PopoverMenu, TintColor, Tooltip,
+    WithScrollbar, prelude::*,
 };
 use workspace::{MultiWorkspace, MultiWorkspaceEvent};
 
@@ -25,8 +26,8 @@ use crate::harness::{
 };
 use crate::helpers::{
     animated_thinking_label, attachment_display_name, attachment_icon, build_input_with_attachments,
-    is_image_path, tool_summary_line, workspace_display_name, workspace_root_path,
-    workspace_storage_key,
+    is_image_path, tool_summary_line, url_has_scheme, workspace_display_name,
+    workspace_root_path, workspace_storage_key,
 };
 use crate::serialization::{
     SerializedHarnessThread, SerializedThreadGroup, SerializedToolKind, SerializedToolStatus,
@@ -70,6 +71,119 @@ struct CodexSessionHandle {
     _update_task: Task<()>,
 }
 
+pub(crate) enum AgentsSurfaceEvent {
+    OpenedInEditor,
+}
+
+fn format_token_count(tokens: usize) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f32 / 1_000_000.0)
+    } else if tokens >= 1000 {
+        format!("{}k", tokens / 1000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn resolve_agent_link(
+    workspace: &Entity<workspace::Workspace>,
+    url: &str,
+    cx: &App,
+) -> Option<PathBuf> {
+    let path = std::path::Path::new(url);
+
+    if path.is_absolute() {
+        return path.exists().then(|| path.to_path_buf());
+    }
+
+    let project = workspace.read(cx).project().clone();
+    let worktrees: Vec<_> = project.read(cx).worktrees(cx).collect();
+
+    // First try joining the link to each worktree root — this covers paths
+    // that are already relative to a project root.
+    for worktree in &worktrees {
+        let abs_path = worktree.read(cx).abs_path();
+        let candidate = abs_path.join(path);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+
+    // Fallback: scan every tracked file and match on a trailing path segment.
+    // Codex sometimes references files by a partial path like
+    // `subdir/file.cpp` or just the basename.
+    let needle = url.trim_start_matches('/');
+    let needle_components: Vec<&str> = needle.split('/').filter(|s| !s.is_empty()).collect();
+    if needle_components.is_empty() {
+        return None;
+    }
+
+    for worktree in &worktrees {
+        let worktree_ref = worktree.read(cx);
+        for entry in worktree_ref.entries(true, 0) {
+            if entry.is_dir() {
+                continue;
+            }
+            let entry_unix = entry.path.as_unix_str();
+            let entry_components: Vec<&str> = entry_unix.split('/').collect();
+            if entry_components.len() < needle_components.len() {
+                continue;
+            }
+            let tail = &entry_components[entry_components.len() - needle_components.len()..];
+            if tail == needle_components.as_slice() {
+                return Some(worktree_ref.absolutize(&entry.path));
+            }
+        }
+    }
+
+    None
+}
+
+fn should_show_role_header(
+    index: usize,
+    message: &TranscriptMessage,
+    all: &[TranscriptMessage],
+) -> bool {
+    // Tool messages render their own header; this helper only governs the
+    // User/Assistant/System bubble label.
+    if matches!(message.role, TranscriptRole::Tool { .. }) {
+        return true;
+    }
+    // Scan backwards past intervening tool messages: an assistant message
+    // that follows another assistant's chunk (with tool calls in between)
+    // is part of the same Codex response, so suppress the duplicate label.
+    for prev in all[..index].iter().rev() {
+        match (&message.role, &prev.role) {
+            (TranscriptRole::Assistant, TranscriptRole::Tool { .. }) => continue,
+            (TranscriptRole::Assistant, TranscriptRole::Assistant) => return false,
+            _ => return true,
+        }
+    }
+    true
+}
+
+fn reset_or_create_markdown(
+    cache: &mut HashMap<(SharedString, usize), (SharedString, Entity<Markdown>)>,
+    key: (SharedString, usize),
+    source: SharedString,
+    cx: &mut App,
+) -> Entity<Markdown> {
+    match cache.get_mut(&key) {
+        Some(entry) => {
+            if entry.0 != source {
+                entry.0 = source.clone();
+                entry.1.update(cx, |md, cx| md.reset(source, cx));
+            }
+            entry.1.clone()
+        }
+        None => {
+            let entity = cx.new(|cx| Markdown::new(source.clone(), None, None, cx));
+            cache.insert(key, (source, entity.clone()));
+            entity
+        }
+    }
+}
+
 pub struct AgentsSurface {
     workspace: Entity<workspace::Workspace>,
     composer_editor: Entity<Editor>,
@@ -82,7 +196,7 @@ pub struct AgentsSurface {
     selected_reasoning_effort: String,
     codex_sessions: HashMap<HarnessThreadId, CodexSessionHandle>,
     expanded_tool_messages: HashSet<(SharedString, usize)>,
-    markdown_cache: HashMap<(SharedString, usize), Entity<Markdown>>,
+    markdown_cache: HashMap<(SharedString, usize), (SharedString, Entity<Markdown>)>,
     transcript_scroll_handle: ScrollHandle,
     _subscriptions: Vec<Subscription>,
 }
@@ -276,6 +390,7 @@ impl AgentsSurface {
             run_status: HarnessRunStatus::Idle,
             messages: Vec::new(),
             estimated_tokens_used: 0,
+            has_reported_tokens: false,
         };
 
         self.threads_by_path
@@ -466,7 +581,12 @@ impl AgentsSurface {
                 .into();
         }
 
-        thread.estimated_tokens_used += text.len() / 4;
+        // Pre-turn estimate is only used until codex reports real usage via
+        // turn/completed; once we have real numbers we stop accumulating
+        // guesses.
+        if !thread.has_reported_tokens {
+            thread.estimated_tokens_used += text.len() / 4;
+        }
         thread.messages.push(TranscriptMessage {
             role: TranscriptRole::User,
             text: text.clone(),
@@ -507,7 +627,9 @@ impl AgentsSurface {
             HarnessTurnUpdate::AssistantDelta { thread_id, delta } => {
                 if let Some(thread) = self.thread_mut(&thread_id) {
                     thread.run_status = HarnessRunStatus::Running;
-                    thread.estimated_tokens_used += delta.len() / 4;
+                    if !thread.has_reported_tokens {
+                        thread.estimated_tokens_used += delta.len() / 4;
+                    }
                     match thread.messages.last_mut() {
                         Some(message) if matches!(message.role, TranscriptRole::Assistant) => {
                             message.text.push_str(&delta);
@@ -575,7 +697,18 @@ impl AgentsSurface {
                         }
                         if !detail.is_empty() {
                             if matches!(display_kind, ToolDisplayKind::Reasoning) {
-                                message.text.push_str(&detail);
+                                // Codex reasoning can be sent either as pure
+                                // deltas or as cumulative snapshots. If the
+                                // new detail already contains what we have,
+                                // treat it as a snapshot and replace; else
+                                // append as a delta.
+                                if detail.as_ref().starts_with(message.text.as_str())
+                                    && detail.len() >= message.text.len()
+                                {
+                                    message.text = detail.to_string();
+                                } else {
+                                    message.text.push_str(&detail);
+                                }
                             } else {
                                 if !message.text.is_empty() {
                                     message.text.push('\n');
@@ -598,6 +731,15 @@ impl AgentsSurface {
                             text: detail.to_string(),
                         });
                     }
+                }
+            }
+            HarnessTurnUpdate::TokensUsed {
+                thread_id,
+                total_tokens,
+            } => {
+                if let Some(thread) = self.thread_mut(&thread_id) {
+                    thread.estimated_tokens_used = total_tokens;
+                    thread.has_reported_tokens = true;
                 }
             }
             HarnessTurnUpdate::Finished { thread_id } => {
@@ -631,6 +773,65 @@ impl AgentsSurface {
         }
 
         cx.notify();
+    }
+
+    fn handle_agent_url_click(
+        &mut self,
+        url: &str,
+        workspace_handle: &gpui::WeakEntity<workspace::Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace) = workspace_handle.upgrade() else {
+            if url_has_scheme(url) {
+                cx.open_url(url);
+            } else {
+                log::warn!("agent link clicked but workspace is gone: {url}");
+            }
+            return;
+        };
+
+        let Some(abs_path) = resolve_agent_link(&workspace, url, cx) else {
+            if url_has_scheme(url) {
+                cx.open_url(url);
+            } else {
+                log::warn!("no file in project matched link: {url}");
+                if let Some(thread) = self.active_thread_mut(cx) {
+                    thread.messages.push(TranscriptMessage {
+                        role: TranscriptRole::System,
+                        text: format!("Could not find file for link: {url}"),
+                    });
+                    cx.notify();
+                }
+            }
+            return;
+        };
+
+        // Prefer opening through find_project_path so the file lands in the
+        // existing worktree's pane with the correct project metadata; fall
+        // back to open_abs_path for files outside any worktree.
+        let project = workspace.read(cx).project().clone();
+        let project_path = project.read(cx).find_project_path(&abs_path, cx);
+
+        workspace.update(cx, |workspace, cx| {
+            if let Some(project_path) = project_path {
+                workspace
+                    .open_path(project_path, None, true, window, cx)
+                    .detach_and_log_err(cx);
+            } else {
+                workspace
+                    .open_abs_path(abs_path.clone(), Default::default(), window, cx)
+                    .detach_and_log_err(cx);
+            }
+        });
+
+        cx.emit(AgentsSurfaceEvent::OpenedInEditor);
+    }
+
+    fn active_thread_mut(&mut self, cx: &App) -> Option<&mut HarnessThread> {
+        let workspace_path = workspace_storage_key(&self.workspace, cx)?;
+        let thread_id = self.active_thread_by_path.get(&workspace_path).cloned()?;
+        self.thread_mut(&thread_id)
     }
 
     fn thread_mut(&mut self, thread_id: &HarnessThreadId) -> Option<&mut HarnessThread> {
@@ -766,6 +967,7 @@ impl AgentsSurface {
                     run_status: HarnessRunStatus::Idle,
                     messages,
                     estimated_tokens_used: serialized.estimated_tokens.unwrap_or(0),
+                    has_reported_tokens: serialized.estimated_tokens.is_some(),
                 });
             }
 
@@ -867,7 +1069,15 @@ impl AgentsSurface {
         let thread_id = thread.id.0.clone();
         let mut messages = Vec::new();
         for (index, message) in thread.messages.iter().enumerate() {
-            messages.push(self.render_message(thread_id.clone(), index, message, window, cx));
+            let show_header = should_show_role_header(index, message, &thread.messages);
+            messages.push(self.render_message(
+                thread_id.clone(),
+                index,
+                message,
+                show_header,
+                window,
+                cx,
+            ));
         }
 
         let status_indicator = thread.run_status.is_active().then(|| {
@@ -923,6 +1133,7 @@ impl AgentsSurface {
         thread_id: SharedString,
         index: usize,
         message: &TranscriptMessage,
+        show_header: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -962,56 +1173,26 @@ impl AgentsSurface {
         let body: AnyElement = if is_assistant && !message.text.is_empty() {
             let source: SharedString = message.text.clone().into();
             let cache_key = (thread_id, index);
-            let markdown_entity = self
-                .markdown_cache
-                .entry(cache_key)
-                .or_insert_with(|| cx.new(|cx| Markdown::new(source.clone(), None, None, cx)))
-                .clone();
-            markdown_entity.update(cx, |md, cx| {
-                md.reset(source, cx);
-            });
+            let markdown_entity = reset_or_create_markdown(
+                &mut self.markdown_cache,
+                cache_key,
+                source,
+                cx,
+            );
             let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
             let workspace_handle = self.workspace.downgrade();
-            let workspace_root = workspace_root_path(&self.workspace, cx);
-            let multi_workspace_weak = self
-                .workspace
-                .read(cx)
-                .multi_workspace()
-                .cloned();
+            let this_weak = cx.entity().downgrade();
             MarkdownElement::new(markdown_entity, style)
                 .on_url_click(move |url, window, cx| {
-                    let raw_path = std::path::Path::new(url.as_ref());
-                    let resolved = if raw_path.is_absolute() {
-                        Some(raw_path.to_path_buf())
-                    } else if let Some(root) = &workspace_root {
-                        Some(root.join(raw_path))
-                    } else {
-                        None
-                    };
-
-                    if let Some(resolved) = resolved.filter(|p| p.exists()) {
-                        if let Some(workspace) = workspace_handle.upgrade() {
-                            workspace
-                                .update(cx, |workspace, cx| {
-                                    workspace.open_abs_path(
-                                        resolved,
-                                        Default::default(),
-                                        window,
-                                        cx,
-                                    )
-                                })
-                                .detach_and_log_err(cx);
-                        }
-                        if let Some(mw) = multi_workspace_weak
-                            .as_ref()
-                            .and_then(|weak| weak.upgrade())
-                        {
-                            mw.update(cx, |mw, cx| {
-                                mw.set_center_surface(None, cx);
-                            });
-                        }
-                    } else {
-                        cx.open_url(&url);
+                    if let Some(this) = this_weak.upgrade() {
+                        this.update(cx, |this, cx| {
+                            this.handle_agent_url_click(
+                                url.as_ref(),
+                                &workspace_handle,
+                                window,
+                                cx,
+                            );
+                        });
                     }
                 })
                 .into_any_element()
@@ -1039,7 +1220,9 @@ impl AgentsSurface {
             .rounded_lg()
             .bg(background)
             .p_3()
-            .child(Label::new(label).size(LabelSize::Small).color(label_color))
+            .when(show_header, |this| {
+                this.child(Label::new(label).size(LabelSize::Small).color(label_color))
+            })
             .child(body)
             .into_any_element()
     }
@@ -1170,16 +1353,12 @@ impl AgentsSurface {
             } else if has_body && is_reasoning {
                 let source: SharedString = body.to_string().into();
                 let cache_key = (key.0.clone(), key.1);
-                let md_entity = self
-                    .markdown_cache
-                    .entry(cache_key)
-                    .or_insert_with(|| {
-                        cx.new(|cx| Markdown::new(source.clone(), None, None, cx))
-                    })
-                    .clone();
-                md_entity.update(cx, |md, cx| {
-                    md.reset(source, cx);
-                });
+                let md_entity = reset_or_create_markdown(
+                    &mut self.markdown_cache,
+                    cache_key,
+                    source,
+                    cx,
+                );
                 let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
                 div()
                     .ml(px(20.0))
@@ -1223,6 +1402,18 @@ impl AgentsSurface {
                     .text_sm()
                     .text_color(Color::Muted.color(cx))
                     .child(SharedString::from("Waiting for output…"))
+                    .into_any_element()
+            } else if is_reasoning {
+                div()
+                    .ml(px(20.0))
+                    .px_3()
+                    .py_2()
+                    .text_sm()
+                    .text_color(Color::Muted.color(cx))
+                    .italic()
+                    .child(SharedString::from(
+                        "No reasoning summary emitted by codex for this turn.",
+                    ))
                     .into_any_element()
             } else {
                 div().into_any_element()
@@ -1761,18 +1952,22 @@ impl AgentsSurface {
         let max_tokens = model_context_window(&self.selected_model) as f32;
         let used = thread.estimated_tokens_used as f32;
         let percentage = ((used / max_tokens) * 100.0).min(100.0) as u32;
-        let used_label = if used >= 1000.0 {
-            format!("~{}k", (used / 1000.0) as u32)
-        } else {
-            format!("~{}", used as u32)
-        };
-        let max_label = format!("{}k", (max_tokens / 1000.0) as u32);
+        let is_estimate = !thread.has_reported_tokens;
+        let prefix = if is_estimate { "~" } else { "" };
+        let used_label = format_token_count(thread.estimated_tokens_used);
+        let max_label = format_token_count(model_context_window(&self.selected_model));
         let bar_color = if percentage >= 85 {
             cx.theme().status().warning
         } else {
             cx.theme().status().info
         };
-        let fraction = (used / max_tokens).min(1.0);
+        let tooltip_text = if is_estimate {
+            format!(
+                "~{percentage}% context used (estimated {used_label} / {max_label} tokens)"
+            )
+        } else {
+            format!("{percentage}% context used ({used_label} / {max_label} tokens)")
+        };
 
         Some(
             h_flex()
@@ -1781,25 +1976,15 @@ impl AgentsSurface {
                 .px_2()
                 .gap_2()
                 .items_center()
-                .tooltip(Tooltip::text(format!(
-                    "~{percentage}% context used ({used_label} / {max_label} tokens)"
-                )))
+                .justify_end()
+                .tooltip(Tooltip::text(tooltip_text))
                 .child(
-                    div()
-                        .flex_1()
-                        .h(px(3.0))
-                        .rounded_full()
-                        .bg(cx.theme().colors().border)
-                        .child(
-                            div()
-                                .h_full()
-                                .rounded_full()
-                                .bg(bar_color)
-                                .w(gpui::relative(fraction)),
-                        ),
+                    CircularProgress::new(used, max_tokens, px(14.0), cx)
+                        .stroke_width(px(2.0))
+                        .progress_color(bar_color),
                 )
                 .child(
-                    Label::new(format!("{used_label} / {max_label}"))
+                    Label::new(format!("{prefix}{used_label} / {max_label}"))
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 )
@@ -1901,4 +2086,6 @@ impl AgentsSurface {
             })
     }
 }
+
+impl EventEmitter<AgentsSurfaceEvent> for AgentsSurface {}
 

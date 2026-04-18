@@ -92,6 +92,10 @@ pub enum HarnessTurnUpdate {
         title: SharedString,
         detail: SharedString,
     },
+    TokensUsed {
+        thread_id: HarnessThreadId,
+        total_tokens: usize,
+    },
     Finished {
         thread_id: HarnessThreadId,
     },
@@ -233,7 +237,7 @@ async fn run_codex_app_server_session_impl(
                 "cwd": config.cwd.to_string_lossy(),
                 "model": config.model,
                 "approvalPolicy": approval_policy_name(&config.approval_policy),
-                "sandbox": sandbox_policy_name(&config.sandbox_policy),
+                "sandboxPolicy": sandbox_policy_value(&config.sandbox_policy),
                 "serviceName": "mnig_code",
             },
         })
@@ -245,7 +249,7 @@ async fn run_codex_app_server_session_impl(
                 "cwd": config.cwd.to_string_lossy(),
                 "model": config.model,
                 "approvalPolicy": approval_policy_name(&config.approval_policy),
-                "sandbox": sandbox_policy_name(&config.sandbox_policy),
+                "sandboxPolicy": sandbox_policy_value(&config.sandbox_policy),
                 "serviceName": "mnig_code",
             },
         })
@@ -461,6 +465,16 @@ async fn handle_notification(
             send_status(updates, thread_id.clone(), HarnessRunStatus::Running).await;
         }
         "turn/completed" => {
+            if let Some(total_tokens) = params.and_then(extract_total_tokens) {
+                send_update(
+                    updates,
+                    HarnessTurnUpdate::TokensUsed {
+                        thread_id: thread_id.clone(),
+                        total_tokens,
+                    },
+                )
+                .await;
+            }
             send_update(
                 updates,
                 HarnessTurnUpdate::Finished {
@@ -500,7 +514,46 @@ async fn handle_notification(
                 .await;
             }
         }
-        _ => {}
+        // Codex sometimes streams reasoning via top-level methods (e.g.
+        // `reasoning/delta`, `thread/reasoning/delta`) that aren't in the
+        // `item/...` namespace. Funnel those into a Reasoning ToolEvent so
+        // the transcript can render them.
+        other
+            if other.contains("reasoning") || other.contains("thinking") || other.contains("thought") =>
+        {
+            let phase = if other.ends_with("/delta") || other.ends_with("/update") {
+                HarnessToolPhase::Update
+            } else if other.ends_with("/end")
+                || other.ends_with("/completed")
+                || other.ends_with("/done")
+            {
+                HarnessToolPhase::End
+            } else {
+                HarnessToolPhase::Start
+            };
+            let detail = params
+                .and_then(|p| reasoning_text(p, p.get("item")))
+                .unwrap_or_default()
+                .into();
+            send_update(
+                updates,
+                HarnessTurnUpdate::ToolEvent {
+                    thread_id: thread_id.clone(),
+                    item_id: params
+                        .and_then(|p| p.get("id").or_else(|| p.get("itemId")))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    kind: HarnessToolKind::Reasoning,
+                    phase,
+                    title: "Reasoning".into(),
+                    detail,
+                },
+            )
+            .await;
+        }
+        other => {
+            log::debug!("unhandled codex notification: {other}");
+        }
     }
 }
 
@@ -604,39 +657,22 @@ fn extract_tool_detail(
     };
     let item_payload = params.get("item");
 
-    // Reasoning: pull text from `item.summary` (array of strings), or the older
-    // `delta` / `text` shapes. Never dump raw JSON for reasoning — empty is
-    // fine, it'll stream in later.
+    // Reasoning: the codex app-server has shipped several shapes over time,
+    // so try every text-bearing field we know about. Never dump raw JSON for
+    // reasoning — empty is fine, it'll stream in via a later event.
     if matches!(kind, HarnessToolKind::Reasoning) {
-        if let Some(summary) = item_payload
-            .and_then(|item| item.get("summary"))
-            .and_then(Value::as_array)
-        {
-            let joined = summary
-                .iter()
-                .filter_map(|value| value.as_str())
-                .collect::<Vec<_>>()
-                .join("\n\n");
-            return joined.into();
+        if let Some(text) = reasoning_text(params, item_payload) {
+            return text.into();
         }
-        if let Some(content) = item_payload
-            .and_then(|item| item.get("content"))
-            .and_then(Value::as_array)
-        {
-            let joined = content
-                .iter()
-                .filter_map(|value| value.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            return joined.into();
+        // Starts normally arrive with an empty body; only warn once content
+        // should have been present but we couldn't find any.
+        if !matches!(phase_str, "added" | "start" | "started") {
+            log::warn!(
+                "reasoning event yielded no text: {}",
+                serde_json::to_string(params).unwrap_or_default()
+            );
         }
-        return params
-            .get("delta")
-            .and_then(Value::as_str)
-            .or_else(|| params.get("text").and_then(Value::as_str))
-            .map(String::from)
-            .unwrap_or_default()
-            .into();
+        return SharedString::default();
     }
 
     let lookup = |key: &str| -> Option<String> {
@@ -752,6 +788,144 @@ fn command_string(params: &Value, item_payload: Option<&Value>) -> Option<String
         return Some(input.to_string());
     }
     None
+}
+
+fn extract_total_tokens(params: &Value) -> Option<usize> {
+    let usage = params
+        .get("usage")
+        .or_else(|| params.get("tokenUsage"))
+        .or_else(|| params.get("token_usage"))?;
+
+    if let Some(total) = usage
+        .get("totalTokens")
+        .or_else(|| usage.get("total_tokens"))
+        .or_else(|| usage.get("total"))
+        .and_then(Value::as_u64)
+    {
+        return Some(total as usize);
+    }
+
+    let input = usage
+        .get("inputTokens")
+        .or_else(|| usage.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = usage
+        .get("outputTokens")
+        .or_else(|| usage.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let reasoning = usage
+        .get("reasoningTokens")
+        .or_else(|| usage.get("reasoning_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cached = usage
+        .get("cachedInputTokens")
+        .or_else(|| usage.get("cached_input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+
+    let sum = input + output + reasoning + cached;
+    if sum > 0 { Some(sum as usize) } else { None }
+}
+
+fn reasoning_text(params: &Value, item_payload: Option<&Value>) -> Option<String> {
+    // The codex app-server has shipped reasoning payloads in many shapes
+    // (summary arrays, content blocks with {type,text}, `parts`, raw deltas,
+    // etc.). Rather than chase every variant, walk the payload recursively
+    // and harvest every text-bearing string field we find. Keys named `id`,
+    // `type`, `role`, `status`, etc. are skipped so we don't pollute the
+    // reasoning pane with metadata.
+    fn ignored_key(key: &str) -> bool {
+        matches!(
+            key,
+            "id" | "type"
+                | "role"
+                | "status"
+                | "itemId"
+                | "item_id"
+                | "threadId"
+                | "thread_id"
+                | "model"
+                | "usage"
+                | "encrypted_content"
+                | "encryptedContent"
+        )
+    }
+
+    fn text_keys() -> &'static [&'static str] {
+        &[
+            "summary",
+            "content",
+            "parts",
+            "text",
+            "value",
+            "delta",
+            "reasoning",
+            "body",
+            "message",
+            "thought",
+            "thoughts",
+            "chunk",
+        ]
+    }
+
+    fn collect_from(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::String(s) if !s.is_empty() => out.push(s.clone()),
+            Value::Array(array) => {
+                for element in array {
+                    collect_from(element, out);
+                }
+            }
+            Value::Object(map) => {
+                for key in text_keys() {
+                    if let Some(inner) = map.get(*key) {
+                        collect_from(inner, out);
+                    }
+                }
+                for (k, v) in map {
+                    if ignored_key(k) || text_keys().contains(&k.as_str()) {
+                        continue;
+                    }
+                    if matches!(v, Value::Array(_) | Value::Object(_)) {
+                        collect_from(v, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = Vec::new();
+    if let Some(item) = item_payload {
+        collect_from(item, &mut out);
+    }
+    // Also consult top-level params keys that carry deltas or text directly
+    // (event shapes like `{ method: "item/reasoning/delta", params: { delta: "..." } }`).
+    if let Value::Object(map) = params {
+        for key in ["delta", "text", "reasoning", "thought"] {
+            if let Some(value) = map.get(key) {
+                collect_from(value, &mut out);
+            }
+        }
+    }
+
+    // Deduplicate consecutive identical chunks (some servers re-emit a running
+    // summary with each update) while preserving order.
+    let mut deduped: Vec<String> = Vec::with_capacity(out.len());
+    for piece in out {
+        if deduped.last().map(String::as_str) != Some(piece.as_str()) {
+            deduped.push(piece);
+        }
+    }
+
+    if deduped.is_empty() {
+        None
+    } else {
+        Some(deduped.join("\n\n"))
+    }
 }
 
 fn tool_title(
@@ -923,13 +1097,6 @@ fn approval_policy_name(policy: &HarnessApprovalPolicy) -> &'static str {
     match policy {
         HarnessApprovalPolicy::Never => "never",
         HarnessApprovalPolicy::OnRequest => "on-request",
-    }
-}
-
-fn sandbox_policy_name(policy: &HarnessSandboxPolicy) -> &'static str {
-    match policy {
-        HarnessSandboxPolicy::DangerFullAccess => "danger-full-access",
-        HarnessSandboxPolicy::WorkspaceWrite => "workspace-write",
     }
 }
 

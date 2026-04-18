@@ -11,7 +11,7 @@ use workspace::{
     MultiWorkspace, MultiWorkspaceEvent, OpenMode, ProjectGroup, SidebarEvent, SidebarSide,
 };
 
-use crate::agents_surface::AgentsSurface;
+use crate::agents_surface::{AgentsSurface, AgentsSurfaceEvent};
 use crate::harness::{HarnessKind, HarnessRunStatus};
 use crate::helpers::{path_display_label, paths_storage_key};
 use crate::mode::{WorkspaceMode, WorkspaceModeSwitcher};
@@ -79,6 +79,17 @@ impl ProjectsSidebar {
         cx.observe(&agents_surface, |_this, _, cx| {
             cx.emit(SidebarEvent::SerializeNeeded);
         })
+        .detach();
+
+        cx.subscribe_in(
+            &agents_surface,
+            window,
+            |this, _, event: &AgentsSurfaceEvent, window, cx| match event {
+                AgentsSurfaceEvent::OpenedInEditor => {
+                    this.set_mode(WorkspaceMode::Editor, window, cx);
+                }
+            },
+        )
         .detach();
 
         let workspaces = multi_workspace
