@@ -45,6 +45,8 @@ pub(crate) struct SerializedTranscriptMessage {
     pub(crate) text: String,
     #[serde(default)]
     pub(crate) attachments: Vec<PathBuf>,
+    #[serde(default)]
+    pub(crate) duration_ms: Option<u64>,
 }
 
 #[derive(Deserialize, Serialize)]

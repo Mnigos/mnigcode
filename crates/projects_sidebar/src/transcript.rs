@@ -1,5 +1,6 @@
 use gpui::SharedString;
 use std::path::PathBuf;
+use std::time::Instant;
 use ui::IconName;
 
 use crate::harness::{HarnessKind, HarnessRunStatus, HarnessThreadId, HarnessToolKind};
@@ -31,6 +32,14 @@ pub(crate) struct TranscriptMessage {
     pub(crate) role: TranscriptRole,
     pub(crate) text: String,
     pub(crate) attachments: Vec<PathBuf>,
+    /// Wall-clock start time captured when the tool message first lands in
+    /// the transcript. Only set for Tool messages; kept in-memory so the
+    /// renderer can show "Thought for Xs" once the tool completes.
+    pub(crate) started_at: Option<Instant>,
+    /// Milliseconds elapsed between start and completion, populated when the
+    /// tool transitions to a terminal status. Persisted so restored threads
+    /// keep the elapsed label.
+    pub(crate) duration_ms: Option<u64>,
 }
 
 impl TranscriptMessage {
@@ -39,6 +48,8 @@ impl TranscriptMessage {
             role,
             text,
             attachments: Vec::new(),
+            started_at: None,
+            duration_ms: None,
         }
     }
 }
