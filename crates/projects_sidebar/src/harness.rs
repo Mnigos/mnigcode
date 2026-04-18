@@ -681,10 +681,12 @@ fn extract_tool_detail(
         if let Some(text) = reasoning_text(params, item_payload) {
             return text.into();
         }
-        // Starts normally arrive with an empty body; only warn once content
-        // should have been present but we couldn't find any.
+        // Codex routinely emits reasoning items with no summary or content
+        // (several gpt-5 variants never produce a reasoning trace for a given
+        // effort level). The renderer surfaces these as a non-expandable
+        // "Thought for Xs" row, so log at debug level rather than warn.
         if !matches!(phase_str, "added" | "start" | "started") {
-            log::warn!(
+            log::debug!(
                 "reasoning event yielded no text: {}",
                 serde_json::to_string(params).unwrap_or_default()
             );

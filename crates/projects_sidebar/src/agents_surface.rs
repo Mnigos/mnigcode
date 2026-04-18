@@ -168,17 +168,23 @@ fn resolve_agent_link(
 }
 
 fn should_skip_message(message: &TranscriptMessage) -> bool {
-    // Hide reasoning tool blocks that ended with no body: codex omits
-    // reasoning summaries for many model/effort combos, and rendering an
-    // empty "Thought" row is just noise.
     match &message.role {
-        TranscriptRole::Tool {
-            kind: ToolDisplayKind::Reasoning,
-            status,
-            ..
-        } if *status != ToolStatus::Running && message.text.trim().is_empty() => true,
         TranscriptRole::Assistant if message.text.is_empty() => true,
         _ => false,
+    }
+}
+
+fn format_thinking_duration(duration_ms: u64) -> String {
+    if duration_ms < 1000 {
+        return "<1s".to_string();
+    }
+    let total_seconds = duration_ms / 1000;
+    if total_seconds < 60 {
+        format!("{total_seconds}s")
+    } else {
+        let minutes = total_seconds / 60;
+        let seconds = total_seconds % 60;
+        format!("{minutes}m {seconds:02}s")
     }
 }
 
@@ -658,6 +664,8 @@ impl AgentsSurface {
             role: TranscriptRole::User,
             text,
             attachments,
+            started_at: None,
+            duration_ms: None,
         });
         thread.run_status = HarnessRunStatus::Connecting;
         cx.notify();
@@ -744,6 +752,7 @@ impl AgentsSurface {
                     });
 
                     if let Some(message) = existing {
+                        let mut transitioned_to_terminal = false;
                         if let TranscriptRole::Tool {
                             status,
                             title: existing_title,
@@ -753,10 +762,24 @@ impl AgentsSurface {
                             if !title.is_empty() {
                                 *existing_title = title.clone();
                             }
-                            *status = match phase {
+                            let next_status = match phase {
                                 HarnessToolPhase::End => ToolStatus::Completed,
                                 _ => ToolStatus::Running,
                             };
+                            if *status == ToolStatus::Running
+                                && next_status != ToolStatus::Running
+                            {
+                                transitioned_to_terminal = true;
+                            }
+                            *status = next_status;
+                        }
+                        if transitioned_to_terminal
+                            && message.duration_ms.is_none()
+                            && let Some(started) = message.started_at.take()
+                        {
+                            message.duration_ms =
+                                Some(started.elapsed().as_millis().min(u128::from(u64::MAX))
+                                    as u64);
                         }
                         if !detail.is_empty() {
                             // Codex can ship tool bodies either as pure deltas
@@ -791,7 +814,7 @@ impl AgentsSurface {
                             HarnessToolPhase::End => ToolStatus::Completed,
                             _ => ToolStatus::Running,
                         };
-                        thread.messages.push(TranscriptMessage::new(
+                        let mut new_message = TranscriptMessage::new(
                             TranscriptRole::Tool {
                                 item_id: item_id.clone(),
                                 kind: display_kind,
@@ -799,7 +822,15 @@ impl AgentsSurface {
                                 title,
                             },
                             detail.to_string(),
-                        ));
+                        );
+                        // Only stamp a start time when the tool is actually
+                        // starting — if we get here on a terminal phase with
+                        // no prior Running record, we have no duration to
+                        // derive.
+                        if status == ToolStatus::Running {
+                            new_message.started_at = Some(std::time::Instant::now());
+                        }
+                        thread.messages.push(new_message);
                     }
                 }
             }
@@ -976,6 +1007,7 @@ impl AgentsSurface {
                                     },
                                     text: message.text.clone(),
                                     attachments: message.attachments.clone(),
+                                    duration_ms: message.duration_ms,
                                 })
                                 .collect(),
                             estimated_tokens: Some(thread.estimated_tokens_used),
@@ -1027,6 +1059,8 @@ impl AgentsSurface {
                         },
                         text: message.text,
                         attachments: message.attachments,
+                        started_at: None,
+                        duration_ms: message.duration_ms,
                     })
                     .collect();
 
@@ -1253,6 +1287,7 @@ impl AgentsSurface {
                 *status,
                 title,
                 &message.text,
+                message.duration_ms,
                 window,
                 cx,
             );
@@ -1357,6 +1392,7 @@ impl AgentsSurface {
         status: ToolStatus,
         title: &SharedString,
         body: &str,
+        duration_ms: Option<u64>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1365,8 +1401,13 @@ impl AgentsSurface {
         let expanded = self.expanded_tool_messages.contains(&key);
         let has_body = !body.trim().is_empty();
         let is_running = status == ToolStatus::Running;
+        // An empty reasoning block that the server never fills in (Codex
+        // routinely emits reasoning items with no summary/content) has
+        // nothing to show on expand, so don't invite the click.
+        let empty_reasoning = is_reasoning && !is_running && !has_body;
         let is_expandable = match kind {
-            ToolDisplayKind::Command | ToolDisplayKind::Reasoning => true,
+            ToolDisplayKind::Reasoning => has_body || is_running,
+            ToolDisplayKind::Command => true,
             _ => has_body || is_running,
         };
         let colors = cx.theme().colors();
@@ -1395,7 +1436,17 @@ impl AgentsSurface {
             if status == ToolStatus::Running {
                 animated_thinking_label().into_any_element()
             } else {
-                Label::new("Thought")
+                let label_text: SharedString = match (empty_reasoning, duration_ms) {
+                    (true, Some(ms)) => {
+                        format!("Thought for {}", format_thinking_duration(ms)).into()
+                    }
+                    (_, Some(ms)) => {
+                        format!("Thought for {}", format_thinking_duration(ms)).into()
+                    }
+                    (true, None) => "Thought".into(),
+                    (false, None) => "Thought".into(),
+                };
+                Label::new(label_text)
                     .size(LabelSize::Small)
                     .color(Color::Muted)
                     .into_any_element()
