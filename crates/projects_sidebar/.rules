@@ -1,0 +1,31 @@
+# projects_sidebar rules
+
+These are traps specific to the agents surface. Repo-wide Rust/GPUI rules live in `.rules` at the root.
+
+## Keep codex RPC payload fields aligned across every entry point
+
+`thread/start`, `thread/resume`, and `turn/start` each carry the sandbox and approval policy. They must use identical keys and value shapes — currently `sandboxPolicy` as an object (`{ "type": "dangerFullAccess" }`), not `sandbox` as a string. If one site drifts, the Codex app-server silently drops the policy for that phase and the thread runs with defaults. When adding or changing a session-level knob, audit all three RPC construction sites at once.
+
+## Reset cached Markdown entities only when source changes
+
+`AgentsSurface::markdown_cache` is keyed by `(thread_id, message_index)` and stores the last rendered source alongside the `Entity<Markdown>`. In `render_message`, compare the new source to the cached one before calling `md.reset(source, cx)`. Every `cx.notify()` during streaming fires a render; resetting unconditionally re-parses the full accumulated assistant text on every delta, which is O(n²) over response length.
+
+## Token accounting switches from estimate to reported exactly once
+
+`thread.has_reported_tokens` flips to `true` the first time Codex sends real usage in `turn/completed`. While it's `false`, accumulate `text.len() / 4` into `estimated_tokens_used` for each user input and assistant delta. Once it's `true`, assign the server's total directly — never add estimates on top, or the count will drift further off with each turn.
+
+## Autoscroll: read offset in render, not in a wheel handler
+
+GPUI's scroll container applies the wheel delta to `ScrollHandle.offset()` before re-running `render`, so the offset you read in `render_transcript` already reflects the user's final scroll position. Derive `stick_to_bottom` there by checking `offset.y + max_offset.y` against a small tolerance (≈4px). A wheel-event handler would see the pre-delta value and fight the user's scroll on every notify.
+
+## Don't clear the composer on a failed or rejected submit
+
+If `submit_composer` bails out (turn already running for the thread, session spawn failed, empty input), leave `composer_editor` text and `pending_attachments` untouched. Users typed that content and will retry. The only safe clear point is the success path right before `prepare_turn_input` consumes the input.
+
+## Cross-window actions reach the sidebar through the Sidebar trait
+
+`workspace` cannot depend on `projects_sidebar`. When a shortcut needs to work from anywhere in the window — e.g. toggling agents mode while focus is in the editor — define the action in `multi_workspace`, extend the `Sidebar` + `SidebarHandle` traits with a default-noop method, implement it on `ProjectsSidebar`, and register the handler on the `MultiWorkspace` root. Handlers bound to `ProjectsSidebar` only fire when the sidebar itself is focused.
+
+## Scope stop-turn cancellation to the active thread
+
+`codex_sessions` owns one `CodexSessionHandle` per `HarnessThreadId`, reused across turns. Cancelling "the session" on stop would tear down sibling threads whose turns are still in flight. Always resolve the specific thread whose turn is being stopped, mark its running tool calls as failed, and cancel only its current turn task.
