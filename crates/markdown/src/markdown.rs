@@ -2009,8 +2009,8 @@ impl Element for MarkdownElement {
                                             *copy_button_visibility
                                                 == CopyButtonVisibility::VisibleOnHover,
                                             |this| {
-                                                this.top_0()
-                                                    .right_0()
+                                                this.top_1p5()
+                                                    .right_1p5()
                                                     .visible_on_hover("code_block")
                                             },
                                             |this| this.top_1p5().right_1p5(),

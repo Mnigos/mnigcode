@@ -544,6 +544,11 @@ impl workspace::Sidebar for ProjectsSidebar {
         self.mode == WorkspaceMode::Agents
     }
 
+    fn toggle_workspace_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let next = self.mode.toggled();
+        self.set_mode(next, window, cx);
+    }
+
     fn top_bar_view(&self, _cx: &App) -> Option<AnyView> {
         Some(self.mode_switcher.clone().into())
     }
