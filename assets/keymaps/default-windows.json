@@ -519,6 +519,7 @@
       "alt-r": "search::ToggleRegex",
       // "ctrl-shift-alt-x": "search::ToggleRegex",
       "ctrl-k shift-enter": "pane::TogglePinTab",
+      "ctrl-alt-m": "multi_workspace::ToggleWorkspaceMode",
     },
   },
   // Bindings from VS Code
@@ -526,6 +527,7 @@
     "context": "Editor",
     "use_key_equivalents": true,
     "bindings": {
+      "ctrl-alt-m": "multi_workspace::ToggleWorkspaceMode",
       "ctrl-[": "editor::Outdent",
       "ctrl-]": "editor::Indent",
       "ctrl-alt-up": ["editor::AddSelectionAbove", { "skip_soft_wrap": true }], // Insert Cursor Above
