@@ -37,6 +37,8 @@ pub(crate) struct SerializedHarnessThread {
     pub(crate) messages: Vec<SerializedTranscriptMessage>,
     #[serde(default)]
     pub(crate) estimated_tokens: Option<usize>,
+    #[serde(default)]
+    pub(crate) has_reported_tokens: bool,
 }
 
 #[derive(Deserialize, Serialize)]
