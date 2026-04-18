@@ -13,8 +13,8 @@ use std::{
     path::PathBuf,
 };
 use ui::{
-    CircularProgress, CommonAnimationExt, ContextMenu, PopoverMenu, TintColor, Tooltip,
-    WithScrollbar, prelude::*,
+    CircularProgress, CommonAnimationExt, ContextMenu, ContextMenuEntry, PopoverMenu, TintColor,
+    Tooltip, WithScrollbar, prelude::*,
 };
 use workspace::{MultiWorkspace, MultiWorkspaceEvent};
 
@@ -46,6 +46,34 @@ fn model_context_window(model: &str) -> usize {
         "gpt-5.2" => 128_000,
         _ => 256_000,
     }
+}
+
+fn permission_trigger_presentation(
+    policy: &HarnessSandboxPolicy,
+) -> (&'static str, IconName, Color) {
+    match policy {
+        HarnessSandboxPolicy::WorkspaceWrite => {
+            ("Default permissions", IconName::LockOutlined, Color::Muted)
+        }
+        HarnessSandboxPolicy::DangerFullAccess => {
+            ("Full access", IconName::Warning, Color::Warning)
+        }
+    }
+}
+
+fn permission_options() -> [(HarnessSandboxPolicy, &'static str, IconName); 2] {
+    [
+        (
+            HarnessSandboxPolicy::WorkspaceWrite,
+            "Default permissions",
+            IconName::LockOutlined,
+        ),
+        (
+            HarnessSandboxPolicy::DangerFullAccess,
+            "Full access",
+            IconName::Warning,
+        ),
+    ]
 }
 
 const AVAILABLE_MODELS: &[(&str, &str)] = &[
@@ -209,6 +237,7 @@ pub struct AgentsSurface {
     previewing_attachment: Option<PathBuf>,
     selected_model: String,
     selected_reasoning_effort: String,
+    selected_sandbox_policy: HarnessSandboxPolicy,
     codex_sessions: HashMap<HarnessThreadId, CodexSessionHandle>,
     expanded_tool_messages: HashSet<(SharedString, usize)>,
     markdown_cache: HashMap<(SharedString, usize), (SharedString, Entity<Markdown>)>,
@@ -261,6 +290,7 @@ impl AgentsSurface {
             previewing_attachment: None,
             selected_model: DEFAULT_MODEL.to_string(),
             selected_reasoning_effort: DEFAULT_REASONING_EFFORT.to_string(),
+            selected_sandbox_policy: HarnessSandboxPolicy::DangerFullAccess,
             codex_sessions: HashMap::new(),
             expanded_tool_messages: HashSet::new(),
             markdown_cache: HashMap::new(),
@@ -555,7 +585,7 @@ impl AgentsSurface {
             cwd: thread.cwd.clone(),
             model: self.selected_model.clone(),
             approval_policy: HarnessApprovalPolicy::Never,
-            sandbox_policy: HarnessSandboxPolicy::DangerFullAccess,
+            sandbox_policy: self.selected_sandbox_policy.clone(),
         };
 
         let (turns_sender, turns_receiver) = channel::unbounded();
@@ -624,7 +654,7 @@ impl AgentsSurface {
             model: self.selected_model.clone(),
             reasoning_effort: self.selected_reasoning_effort.clone(),
             approval_policy: HarnessApprovalPolicy::Never,
-            sandbox_policy: HarnessSandboxPolicy::DangerFullAccess,
+            sandbox_policy: self.selected_sandbox_policy.clone(),
         })
     }
 
@@ -1032,6 +1062,14 @@ impl AgentsSurface {
 
     pub(crate) fn set_selected_reasoning_effort(&mut self, effort: String) {
         self.selected_reasoning_effort = effort;
+    }
+
+    pub(crate) fn selected_sandbox_policy(&self) -> &HarnessSandboxPolicy {
+        &self.selected_sandbox_policy
+    }
+
+    pub(crate) fn set_selected_sandbox_policy(&mut self, policy: HarnessSandboxPolicy) {
+        self.selected_sandbox_policy = policy;
     }
 }
 
@@ -2033,20 +2071,54 @@ impl AgentsSurface {
                     .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
                     .style(ButtonStyle::Subtle),
             )
-            .child(
-                Button::new("agent-permission-selector", "Full access")
+            .child(self.render_permission_selector(cx))
+            .child(div().flex_1())
+            .child(self.render_branch_selector(cx))
+    }
+
+    fn render_permission_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (trigger_label, trigger_icon, trigger_color) =
+            permission_trigger_presentation(&self.selected_sandbox_policy);
+
+        let this = cx.entity().downgrade();
+        PopoverMenu::new("agent-permission-selector")
+            .anchor(gpui::Corner::TopLeft)
+            .trigger(
+                Button::new("agent-composer-permission", trigger_label)
                     .label_size(LabelSize::Small)
-                    .color(Color::Warning)
+                    .color(trigger_color)
                     .start_icon(
-                        Icon::new(IconName::Warning)
+                        Icon::new(trigger_icon)
                             .size(IconSize::XSmall)
-                            .color(Color::Warning),
+                            .color(trigger_color),
                     )
                     .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
                     .style(ButtonStyle::Subtle),
             )
-            .child(div().flex_1())
-            .child(self.render_branch_selector(cx))
+            .menu(move |window, cx| {
+                let this = this.clone();
+                let current = this.upgrade()?.read(cx).selected_sandbox_policy.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _window, _cx| {
+                    for (policy, label, icon) in permission_options() {
+                        let this = this.clone();
+                        let is_selected = current == policy;
+                        let entry = ContextMenuEntry::new(label)
+                            .icon(icon)
+                            .toggleable(IconPosition::End, is_selected)
+                            .handler(move |_window, cx| {
+                                if let Some(this) = this.upgrade() {
+                                    let policy = policy.clone();
+                                    this.update(cx, |this, cx| {
+                                        this.selected_sandbox_policy = policy;
+                                        cx.notify();
+                                    });
+                                }
+                            });
+                        menu.push_item(entry);
+                    }
+                    menu
+                }))
+            })
     }
 
     fn render_branch_selector(&self, cx: &mut Context<Self>) -> impl IntoElement {

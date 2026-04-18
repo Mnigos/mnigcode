@@ -15,6 +15,8 @@ pub(crate) struct SerializedProjectsSidebar {
     pub(crate) selected_model: Option<String>,
     #[serde(default)]
     pub(crate) selected_reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub(crate) selected_sandbox_policy: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]

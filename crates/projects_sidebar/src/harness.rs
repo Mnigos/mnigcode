@@ -44,11 +44,28 @@ pub enum HarnessApprovalPolicy {
     OnRequest,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum HarnessSandboxPolicy {
     DangerFullAccess,
     WorkspaceWrite,
+}
+
+impl HarnessSandboxPolicy {
+    pub fn serialization_key(&self) -> &'static str {
+        match self {
+            HarnessSandboxPolicy::DangerFullAccess => "dangerFullAccess",
+            HarnessSandboxPolicy::WorkspaceWrite => "workspaceWrite",
+        }
+    }
+
+    pub fn from_serialization_key(value: &str) -> Option<Self> {
+        match value {
+            "dangerFullAccess" => Some(HarnessSandboxPolicy::DangerFullAccess),
+            "workspaceWrite" => Some(HarnessSandboxPolicy::WorkspaceWrite),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -805,6 +822,9 @@ fn extract_total_tokens(params: &Value) -> Option<usize> {
         return Some(total as usize);
     }
 
+    // `inputTokens` already includes `cachedInputTokens` and `outputTokens`
+    // already includes `reasoningTokens` in OpenAI's usage schema, so only
+    // sum the two top-level buckets here when a pre-computed total is absent.
     let input = usage
         .get("inputTokens")
         .or_else(|| usage.get("input_tokens"))
@@ -815,18 +835,8 @@ fn extract_total_tokens(params: &Value) -> Option<usize> {
         .or_else(|| usage.get("output_tokens"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let reasoning = usage
-        .get("reasoningTokens")
-        .or_else(|| usage.get("reasoning_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let cached = usage
-        .get("cachedInputTokens")
-        .or_else(|| usage.get("cached_input_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
 
-    let sum = input + output + reasoning + cached;
+    let sum = input + output;
     if sum > 0 { Some(sum as usize) } else { None }
 }
 
