@@ -97,8 +97,8 @@ impl BlinkManager {
     ) {
         self.blink_enabled_override = blink_enabled_override;
         if self.enabled {
-            self.show_cursor(cx);
             self.blink_cursors(self.blink_epoch, cx);
+            self.show_cursor(cx);
         }
     }
 
