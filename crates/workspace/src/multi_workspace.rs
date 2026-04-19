@@ -1903,6 +1903,9 @@ impl Render for MultiWorkspace {
                 // The handlers themselves no-op when there is no sidebar.
                 .on_action(cx.listener(
                     |this: &mut Self, _: &ToggleWorkspaceMode, window, cx| {
+                        if !this.multi_workspace_enabled(cx) {
+                            return;
+                        }
                         if let Some(sidebar) = &this.sidebar {
                             sidebar.toggle_workspace_mode(window, cx);
                         }
@@ -1910,6 +1913,9 @@ impl Render for MultiWorkspace {
                 ))
                 .on_action(cx.listener(
                     |this: &mut Self, _: &NewThread, window, cx| {
+                        if !this.multi_workspace_enabled(cx) {
+                            return;
+                        }
                         if let Some(sidebar) = &this.sidebar {
                             sidebar.new_thread_in_active_project(window, cx);
                         }

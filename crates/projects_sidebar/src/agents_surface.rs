@@ -419,27 +419,27 @@ impl TranscriptView {
             return div().into_any_element();
         };
 
-        if index == thread.messages.len() {
-            return self.render_status_indicator(&thread, cx);
-        }
+        let content = if index == thread.messages.len() {
+            self.render_status_indicator(&thread, cx)
+        } else {
+            let Some(message) = thread.messages.get(index) else {
+                return div().into_any_element();
+            };
 
-        let Some(message) = thread.messages.get(index) else {
-            return div().into_any_element();
+            if should_skip_message(message) {
+                return div().into_any_element();
+            }
+
+            let show_header = should_show_role_header(index, message, &thread.messages);
+            self.render_message(
+                thread.id.0.clone(),
+                index,
+                message,
+                show_header,
+                window,
+                cx,
+            )
         };
-
-        if should_skip_message(message) {
-            return div().into_any_element();
-        }
-
-        let show_header = should_show_role_header(index, message, &thread.messages);
-        let content = self.render_message(
-            thread.id.0.clone(),
-            index,
-            message,
-            show_header,
-            window,
-            cx,
-        );
 
         h_flex()
             .w_full()
