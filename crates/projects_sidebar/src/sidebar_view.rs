@@ -1,10 +1,11 @@
 use gpui::{
     AnyElement, AnyView, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    PathPromptOptions, Pixels, Render, SharedString, Subscription, WeakEntity, Window, px,
+    PathPromptOptions, Pixels, Render, SharedString, Subscription, Task, WeakEntity, Window, px,
 };
 use std::{
     collections::HashSet,
     path::PathBuf,
+    time::Duration,
 };
 use ui::{CommonAnimationExt, Tooltip, prelude::*};
 use workspace::{
@@ -36,8 +37,11 @@ pub struct ProjectsSidebar {
     focus_handle: FocusHandle,
     mode: WorkspaceMode,
     subscribed_workspaces: HashSet<EntityId>,
+    serialize_debounce: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
+
+const SERIALIZE_DEBOUNCE: Duration = Duration::from_millis(300);
 
 impl ProjectsSidebar {
     pub fn new(
@@ -71,13 +75,13 @@ impl ProjectsSidebar {
         )
         .detach();
 
-        // Serialize thread state whenever agents_surface changes (turn
-        // finishes, user stops, new thread created). The observe fires on
-        // every cx.notify() from agents_surface; the serialize call is async
-        // and deduplicates via a single in-flight task so rapid fires are
-        // cheap.
-        cx.observe(&agents_surface, |_this, _, cx| {
-            cx.emit(SidebarEvent::SerializeNeeded);
+        // Serialize thread state whenever agents_surface changes, coalescing
+        // bursts (streaming deltas, rapid tool events) so we don't walk and
+        // write every message on every token. The debounce window is short
+        // enough that interactive saves (new thread, stop, etc.) still feel
+        // immediate.
+        cx.observe(&agents_surface, |this, _, cx| {
+            this.schedule_serialize(cx);
         })
         .detach();
 
@@ -134,6 +138,7 @@ impl ProjectsSidebar {
             focus_handle: cx.focus_handle(),
             mode: WorkspaceMode::Editor,
             subscribed_workspaces: HashSet::new(),
+            serialize_debounce: None,
             _subscriptions: Vec::new(),
         };
 
@@ -146,6 +151,20 @@ impl ProjectsSidebar {
 
     pub(crate) fn mode(&self) -> WorkspaceMode {
         self.mode
+    }
+
+    fn schedule_serialize(&mut self, cx: &mut Context<Self>) {
+        if self.serialize_debounce.is_some() {
+            return;
+        }
+        self.serialize_debounce = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SERIALIZE_DEBOUNCE).await;
+            this.update(cx, |this, cx| {
+                this.serialize_debounce = None;
+                cx.emit(SidebarEvent::SerializeNeeded);
+            })
+            .ok();
+        }));
     }
 
     pub(crate) fn set_mode(
@@ -629,8 +648,8 @@ impl workspace::Sidebar for ProjectsSidebar {
                     selected_sandbox_policy,
                 } = serialized;
                 self.mode = mode;
-                self.agents_surface.update(cx, |agents_surface, _| {
-                    agents_surface.restore_threads(thread_groups);
+                self.agents_surface.update(cx, |agents_surface, cx| {
+                    agents_surface.restore_threads(thread_groups, cx);
                     agents_surface.set_next_thread_number(next_thread_number);
                     if let Some(model) = selected_model {
                         agents_surface.set_selected_model(model);

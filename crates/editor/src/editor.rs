@@ -24367,6 +24367,12 @@ impl Editor {
         cx.notify();
     }
 
+    pub fn set_cursor_blink(&mut self, is_enabled: bool, cx: &mut Context<Self>) {
+        self.blink_manager.update(cx, |blink_manager, cx| {
+            blink_manager.set_blink_enabled_override(Some(is_enabled), cx);
+        });
+    }
+
     fn on_buffer_changed(&mut self, _: Entity<MultiBuffer>, cx: &mut Context<Self>) {
         cx.notify();
     }
