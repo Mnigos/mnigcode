@@ -13506,6 +13506,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smol",
+ "terminal_view",
  "ui",
  "workspace",
 ]

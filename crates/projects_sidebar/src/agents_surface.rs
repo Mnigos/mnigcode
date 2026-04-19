@@ -16,7 +16,8 @@ use ui::{
     CircularProgress, CommonAnimationExt, ContextMenu, ContextMenuEntry, PopoverMenu, TintColor,
     Tooltip, WithScrollbar, prelude::*,
 };
-use workspace::{MultiWorkspace, MultiWorkspaceEvent};
+use terminal_view::terminal_panel::Toggle as ToggleTerminalPanel;
+use workspace::{MultiWorkspace, MultiWorkspaceEvent, NewThread, ToggleWorkspaceMode};
 
 use crate::COMPOSER_KEY_CONTEXT;
 use crate::harness::{
@@ -101,6 +102,9 @@ struct CodexSessionHandle {
 
 pub(crate) enum AgentsSurfaceEvent {
     OpenedInEditor,
+    ToggleModeRequested,
+    NewThreadRequested,
+    ToggleTerminalRequested,
 }
 
 fn format_token_count(tokens: usize) -> String {
@@ -1141,13 +1145,19 @@ impl Render for AgentsSurface {
             .id("agents-surface")
             .key_context(COMPOSER_KEY_CONTEXT)
             .on_action(cx.listener(Self::send_message))
+            .on_action(cx.listener(|_this, _: &ToggleWorkspaceMode, _window, cx| {
+                cx.emit(AgentsSurfaceEvent::ToggleModeRequested);
+            }))
+            .on_action(cx.listener(|_this, _: &NewThread, _window, cx| {
+                cx.emit(AgentsSurfaceEvent::NewThreadRequested);
+            }))
+            .on_action(cx.listener(|_this, _: &ToggleTerminalPanel, _window, cx| {
+                cx.emit(AgentsSurfaceEvent::ToggleTerminalRequested);
+            }))
             .size_full()
             .relative()
             .overflow_hidden()
             .bg(colors.editor_background)
-            .on_mouse_down(MouseButton::Left, |_, window, _cx| {
-                window.blur();
-            })
             .children(titlebar_item)
             .child(
                 h_flex()

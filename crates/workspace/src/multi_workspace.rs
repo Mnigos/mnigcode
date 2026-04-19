@@ -1898,6 +1898,23 @@ impl Render for MultiWorkspace {
                 .font(ui_font)
                 .text_color(text_color)
                 .on_action(cx.listener(Self::close_window))
+                // These handlers need to fire on every build where the sidebar
+                // is present, not only when `multi_workspace_enabled` is on.
+                // The handlers themselves no-op when there is no sidebar.
+                .on_action(cx.listener(
+                    |this: &mut Self, _: &ToggleWorkspaceMode, window, cx| {
+                        if let Some(sidebar) = &this.sidebar {
+                            sidebar.toggle_workspace_mode(window, cx);
+                        }
+                    },
+                ))
+                .on_action(cx.listener(
+                    |this: &mut Self, _: &NewThread, window, cx| {
+                        if let Some(sidebar) = &this.sidebar {
+                            sidebar.new_thread_in_active_project(window, cx);
+                        }
+                    },
+                ))
                 .when(self.multi_workspace_enabled(cx), |this| {
                     this.on_action(cx.listener(
                         |this: &mut Self, _: &ToggleWorkspaceSidebar, window, cx| {
@@ -1945,20 +1962,6 @@ impl Render for MultiWorkspace {
                             }
                         }),
                     )
-                    .on_action(cx.listener(
-                        |this: &mut Self, _: &ToggleWorkspaceMode, window, cx| {
-                            if let Some(sidebar) = &this.sidebar {
-                                sidebar.toggle_workspace_mode(window, cx);
-                            }
-                        },
-                    ))
-                    .on_action(cx.listener(
-                        |this: &mut Self, _: &NewThread, window, cx| {
-                            if let Some(sidebar) = &this.sidebar {
-                                sidebar.new_thread_in_active_project(window, cx);
-                            }
-                        },
-                    ))
                     .when(self.project_group_keys().len() >= 2, |el| {
                         el.on_action(cx.listener(
                             |this: &mut Self, _: &MoveProjectToNewWindow, window, cx| {
