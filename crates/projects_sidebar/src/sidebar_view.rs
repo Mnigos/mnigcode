@@ -8,7 +8,7 @@ use std::{
 };
 use ui::{CommonAnimationExt, Tooltip, prelude::*};
 use workspace::{
-    MultiWorkspace, MultiWorkspaceEvent, OpenMode, ProjectGroup, SidebarEvent, SidebarSide,
+    MultiWorkspace, MultiWorkspaceEvent, OpenMode, ProjectGroup, Sidebar, SidebarEvent, SidebarSide,
 };
 
 use crate::agents_surface::{AgentsSurface, AgentsSurfaceEvent};
@@ -87,6 +87,34 @@ impl ProjectsSidebar {
             |this, _, event: &AgentsSurfaceEvent, window, cx| match event {
                 AgentsSurfaceEvent::OpenedInEditor => {
                     this.set_mode(WorkspaceMode::Editor, window, cx);
+                }
+                AgentsSurfaceEvent::ToggleModeRequested => {
+                    let next_mode = match this.mode() {
+                        WorkspaceMode::Agents => WorkspaceMode::Editor,
+                        WorkspaceMode::Editor => WorkspaceMode::Agents,
+                    };
+                    this.set_mode(next_mode, window, cx);
+                }
+                AgentsSurfaceEvent::NewThreadRequested => {
+                    this.new_thread_in_active_project(window, cx);
+                }
+                AgentsSurfaceEvent::ToggleTerminalRequested => {
+                    // Switch to editor mode so the terminal panel can render,
+                    // then dispatch the action on the workspace so its
+                    // registered handler fires.
+                    this.set_mode(WorkspaceMode::Editor, window, cx);
+                    if let Some(workspace) = this.active_workspace(cx) {
+                        workspace.update(cx, |_, cx| {
+                            cx.defer_in(window, |_, window, cx| {
+                                window.dispatch_action(
+                                    Box::new(
+                                        terminal_view::terminal_panel::Toggle,
+                                    ),
+                                    cx,
+                                );
+                            });
+                        });
+                    }
                 }
             },
         )
