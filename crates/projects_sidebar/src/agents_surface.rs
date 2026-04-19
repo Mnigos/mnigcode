@@ -1,8 +1,8 @@
 use editor::Editor;
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, ExternalPaths, Focusable, MouseButton,
-    ObjectFit, PathPromptOptions, Pixels, Render, ScrollHandle, SharedString, Subscription, Task,
-    Window, deferred, img, px,
+    AnyElement, App, Context, Entity, EventEmitter, ExternalPaths, Focusable, ListAlignment,
+    ListSizingBehavior, ListState, MouseButton, ObjectFit, PathPromptOptions, Pixels, Render,
+    SharedString, Subscription, Task, WeakEntity, Window, deferred, img, list, px,
 };
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use language::language_settings::SoftWrap;
@@ -11,6 +11,8 @@ use smol::channel;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
+    sync::Arc,
+    time::Duration,
 };
 use ui::{
     CircularProgress, CommonAnimationExt, ContextMenu, ContextMenuEntry, PopoverMenu, TintColor,
@@ -237,112 +239,81 @@ fn reset_or_create_markdown(
     }
 }
 
-pub struct AgentsSurface {
-    workspace: Entity<workspace::Workspace>,
-    composer_editor: Entity<Editor>,
-    pub(crate) active_thread_by_path: HashMap<String, HarnessThreadId>,
-    pub(crate) threads_by_path: HashMap<String, Vec<HarnessThread>>,
-    next_thread_number: usize,
-    pending_attachments: Vec<PathBuf>,
-    previewing_attachment: Option<PathBuf>,
-    selected_model: String,
-    selected_reasoning_effort: String,
-    selected_sandbox_policy: HarnessSandboxPolicy,
-    codex_sessions: HashMap<HarnessThreadId, CodexSessionHandle>,
-    expanded_tool_messages: HashSet<(SharedString, usize)>,
-    markdown_cache: HashMap<(SharedString, usize), (SharedString, Entity<Markdown>)>,
-    transcript_scroll_handle: ScrollHandle,
-    /// When true, new transcript content pins the scroll position to the
-    /// bottom. Turns off once the user scrolls up and re-engages when they
-    /// return to the bottom.
-    stick_to_bottom: bool,
-    _subscriptions: Vec<Subscription>,
+enum TranscriptViewEvent {
+    OpenedInEditor,
+    PreviewRequested(PathBuf),
 }
 
-impl AgentsSurface {
-    pub(crate) fn new(
-        multi_workspace: Entity<MultiWorkspace>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        let workspace = multi_workspace.read(cx).workspace().clone();
+struct TranscriptView {
+    workspace: WeakEntity<workspace::Workspace>,
+    active_thread: Option<Arc<HarnessThread>>,
+    expanded_tool_messages: HashSet<(SharedString, usize)>,
+    markdown_cache: HashMap<(SharedString, usize), (SharedString, Entity<Markdown>)>,
+    list_state: ListState,
+}
 
-        let composer_editor = cx.new(|cx| {
-            let mut editor = Editor::auto_height(1, 8, window, cx);
-            editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
-            editor.set_placeholder_text(
-                "Ask anything, @ to add files, / for commands",
-                window,
-                cx,
-            );
-            editor.set_show_indent_guides(false, cx);
-            editor
-        });
-
-        let active_workspace_subscription = cx.subscribe_in(
-            &multi_workspace,
-            window,
-            |this, multi_workspace, event: &MultiWorkspaceEvent, _window, cx| {
-                if matches!(event, MultiWorkspaceEvent::ActiveWorkspaceChanged) {
-                    this.workspace = multi_workspace.read(cx).workspace().clone();
-                    cx.notify();
-                }
-            },
-        );
-
+impl TranscriptView {
+    fn new(workspace: Entity<workspace::Workspace>) -> Self {
+        let list_state = ListState::new(0, ListAlignment::Top, px(2048.0));
+        list_state.set_follow_mode(gpui::FollowMode::Tail);
         Self {
-            workspace,
-            composer_editor,
-            active_thread_by_path: HashMap::default(),
-            threads_by_path: HashMap::default(),
-            next_thread_number: 1,
-            pending_attachments: Vec::new(),
-            previewing_attachment: None,
-            selected_model: DEFAULT_MODEL.to_string(),
-            selected_reasoning_effort: DEFAULT_REASONING_EFFORT.to_string(),
-            selected_sandbox_policy: HarnessSandboxPolicy::DangerFullAccess,
-            codex_sessions: HashMap::new(),
-            expanded_tool_messages: HashSet::new(),
-            markdown_cache: HashMap::new(),
-            transcript_scroll_handle: ScrollHandle::new(),
-            stick_to_bottom: true,
-            _subscriptions: vec![active_workspace_subscription],
+            workspace: workspace.downgrade(),
+            active_thread: None,
+            expanded_tool_messages: HashSet::default(),
+            markdown_cache: HashMap::default(),
+            list_state,
         }
     }
 
-    fn add_attachments<I>(&mut self, paths: I, cx: &mut Context<Self>)
-    where
-        I: IntoIterator<Item = PathBuf>,
-    {
-        let mut added = false;
-        for path in paths {
-            if !self
-                .pending_attachments
-                .iter()
-                .any(|existing| existing == &path)
-            {
-                self.pending_attachments.push(path);
-                added = true;
+    fn sync_state(
+        &mut self,
+        workspace: Entity<workspace::Workspace>,
+        thread: Option<HarnessThread>,
+        cx: &mut Context<Self>,
+    ) {
+        let previous_thread_id = self.active_thread.as_ref().map(|thread| thread.id.clone());
+        let next_thread_id = thread.as_ref().map(|thread| thread.id.clone());
+        let previous_count = self.item_count();
+
+        self.workspace = workspace.downgrade();
+        self.active_thread = thread.map(Arc::new);
+
+        if previous_thread_id != next_thread_id {
+            self.expanded_tool_messages.clear();
+            self.markdown_cache.clear();
+            self.list_state.reset(self.item_count());
+            self.list_state.set_follow_mode(gpui::FollowMode::Tail);
+            self.list_state.scroll_to_end();
+        } else {
+            let item_count = self.item_count();
+            if previous_count != item_count {
+                self.list_state.splice(0..previous_count, item_count);
             }
+            self.list_state.remeasure();
         }
-        if added {
-            cx.notify();
-        }
-    }
 
-    fn preview_attachment(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        self.previewing_attachment = Some(path);
+        self.prune_markdown_cache();
         cx.notify();
     }
 
-    fn dismiss_preview(&mut self, cx: &mut Context<Self>) {
-        if self.previewing_attachment.take().is_some() {
-            cx.notify();
-        }
+    fn item_count(&self) -> usize {
+        let Some(thread) = self.active_thread.as_ref() else {
+            return 0;
+        };
+
+        thread.messages.len() + usize::from(thread.run_status.is_active())
     }
 
-    pub(crate) fn composer_editor(&self) -> &Entity<Editor> {
-        &self.composer_editor
+    fn prune_markdown_cache(&mut self) {
+        let Some(thread) = self.active_thread.as_ref() else {
+            self.markdown_cache.clear();
+            return;
+        };
+
+        let thread_id = &thread.id.0;
+        self.markdown_cache.retain(|(cached_thread_id, index), _| {
+            cached_thread_id == thread_id && *index < thread.messages.len()
+        });
     }
 
     fn toggle_tool_expansion(
@@ -358,532 +329,19 @@ impl AgentsSurface {
         cx.notify();
     }
 
-    fn pick_attachments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let receiver = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: Some("Attach files".into()),
-        });
-
-        cx.spawn_in(window, async move |this, cx| {
-            let paths = match receiver.await {
-                Ok(Ok(Some(paths))) => paths,
-                _ => return,
-            };
-
-            this.update(cx, |this, cx| {
-                this.add_attachments(paths, cx);
-            })
-            .ok();
-        })
-        .detach();
+    fn request_preview(&self, path: PathBuf, cx: &mut Context<Self>) {
+        cx.emit(TranscriptViewEvent::PreviewRequested(path));
     }
 
-    fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
-        if index < self.pending_attachments.len() {
-            self.pending_attachments.remove(index);
-            cx.notify();
-        }
-    }
-
-    fn focus_composer(&self, window: &mut Window, cx: &mut App) {
-        self.composer_editor
-            .read(cx)
-            .focus_handle(cx)
-            .focus(window, cx);
-    }
-
-    pub(crate) fn thread_summaries_for_workspace_path(
-        &self,
-        workspace_path: &str,
-    ) -> Vec<HarnessThreadSummary> {
-        let active_thread_id = self.active_thread_by_path.get(workspace_path);
-        self.threads_by_path
-            .get(workspace_path)
-            .map(|threads| {
-                threads
-                    .iter()
-                    .map(|thread| HarnessThreadSummary {
-                        id: thread.id.clone(),
-                        title: thread.title.clone(),
-                        harness_kind: thread.harness_kind.clone(),
-                        run_status: thread.run_status.clone(),
-                        is_active: active_thread_id == Some(&thread.id),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn activate_thread(
-        &mut self,
-        workspace: Entity<workspace::Workspace>,
-        thread_id: HarnessThreadId,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(workspace_path) = workspace_storage_key(&workspace, cx) else {
-            return;
-        };
-        self.workspace = workspace;
-        self.active_thread_by_path.insert(workspace_path, thread_id);
-        cx.notify();
-    }
-
-    pub(crate) fn start_thread(
-        &mut self,
-        workspace: Entity<workspace::Workspace>,
-        cx: &mut Context<Self>,
-    ) -> Option<HarnessThreadId> {
-        let workspace_path = workspace_storage_key(&workspace, cx)?;
-        self.workspace = workspace.clone();
-        let thread_id = HarnessThreadId(format!("thread-{}", self.next_thread_number).into());
-        self.next_thread_number += 1;
-
-        let thread = HarnessThread {
-            id: thread_id.clone(),
-            provider_thread_id: None,
-            title: "New thread".into(),
-            cwd: workspace_root_path(&workspace, cx)
-                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-            harness_kind: HarnessKind::Codex,
-            run_status: HarnessRunStatus::Idle,
-            messages: Vec::new(),
-            estimated_tokens_used: 0,
-            has_reported_tokens: false,
-        };
-
-        self.threads_by_path
-            .entry(workspace_path.clone())
-            .or_default()
-            .push(thread);
-        self.active_thread_by_path
-            .insert(workspace_path, thread_id.clone());
-        cx.notify();
-        Some(thread_id)
-    }
-
-    fn send_message(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
-        self.submit_composer(window, cx);
-    }
-
-    fn is_turn_running(&self, cx: &App) -> bool {
-        self.active_thread(cx)
-            .is_some_and(|thread| thread.run_status.is_active())
-    }
-
-    fn stop_active_turn(&mut self, cx: &mut Context<Self>) {
-        let Some(workspace_path) = workspace_storage_key(&self.workspace, cx) else {
-            return;
-        };
-        let Some(thread_id) = self.active_thread_by_path.get(&workspace_path).cloned() else {
-            return;
-        };
-
-        // Drop the active thread's codex session to kill its child process
-        // and cancel the in-flight turn. Other threads' sessions are left
-        // untouched so concurrent runs keep going. The next submit on this
-        // thread will start a fresh session via thread/resume.
-        self.codex_sessions.remove(&thread_id);
-
-        if let Some(thread) = self.thread_mut(&thread_id) {
-            thread.run_status = HarnessRunStatus::Idle;
-            for message in thread.messages.iter_mut() {
-                if let TranscriptRole::Tool { status, .. } = &mut message.role {
-                    if *status == ToolStatus::Running {
-                        *status = ToolStatus::Failed;
-                    }
-                }
-            }
-        }
-        cx.notify();
-    }
-
-    fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let has_attachments = !self.pending_attachments.is_empty();
-        let text = self.composer_editor.read(cx).text(cx).trim().to_string();
-
-        if text.is_empty() && !has_attachments {
-            return;
-        }
-
-        let workspace = self.workspace.clone();
-        let Some(workspace_path) = workspace_storage_key(&workspace, cx) else {
-            return;
-        };
-        let thread_id = if let Some(existing) = self.active_thread_by_path.get(&workspace_path) {
-            existing.clone()
-        } else if let Some(new_id) = self.start_thread(workspace, cx) {
-            new_id
-        } else {
-            return;
-        };
-
-        // If the thread is already running a turn, surface a system message
-        // and keep the composer intact so the user can retry after it
-        // finishes rather than losing what they typed.
-        if self
-            .thread_mut(&thread_id)
-            .is_some_and(|thread| thread.run_status.is_active())
-        {
-            if let Some(thread) = self.thread_mut(&thread_id) {
-                thread.messages.push(TranscriptMessage::new(
-                    TranscriptRole::System,
-                    "Agent is already working on this thread. Please wait for this turn to finish."
-                        .to_string(),
-                ));
-            }
-            cx.notify();
-            return;
-        }
-
-        self.composer_editor.update(cx, |editor, cx| {
-            editor.clear(window, cx);
-        });
-        let attachments = std::mem::take(&mut self.pending_attachments);
-
-        // Sending a new message re-engages autoscroll so the user always sees
-        // their own turn land at the bottom even if they were scrolled up to
-        // reread earlier context.
-        self.stick_to_bottom = true;
-
-        let Some(turn_input) =
-            self.prepare_turn_input(thread_id.clone(), text, attachments, cx)
-        else {
-            return;
-        };
-
-        let Some(session_sender) = self.ensure_codex_session(&thread_id, cx) else {
-            return;
-        };
-        if session_sender.try_send(turn_input).is_err() {
-            if let Some(thread) = self.thread_mut(&thread_id) {
-                thread.run_status = HarnessRunStatus::Failed("codex session closed".into());
-                thread.messages.push(TranscriptMessage::new(
-                    TranscriptRole::System,
-                    "Agent session closed unexpectedly. Please try again.".to_string(),
-                ));
-            }
-            self.codex_sessions.remove(&thread_id);
-        }
-
-        cx.notify();
-    }
-
-    fn ensure_codex_session(
-        &mut self,
-        thread_id: &HarnessThreadId,
-        cx: &mut Context<Self>,
-    ) -> Option<channel::Sender<HarnessTurnInput>> {
-        if let Some(session) = self.codex_sessions.get(thread_id) {
-            if !session.turns.is_closed() {
-                return Some(session.turns.clone());
-            }
-            self.codex_sessions.remove(thread_id);
-        }
-
-        let thread = self
-            .threads_by_path
-            .values()
-            .flat_map(|threads| threads.iter())
-            .find(|thread| &thread.id == thread_id)?;
-
-        let config = HarnessSessionConfig {
-            thread_id: thread_id.clone(),
-            provider_thread_id: thread.provider_thread_id.clone(),
-            cwd: thread.cwd.clone(),
-            model: self.selected_model.clone(),
-            approval_policy: HarnessApprovalPolicy::Never,
-            sandbox_policy: self.selected_sandbox_policy.clone(),
-        };
-
-        let (turns_sender, turns_receiver) = channel::unbounded();
-        let (updates_sender, updates_receiver) = channel::unbounded();
-        let session_task = cx.background_spawn(run_codex_app_server_session(
-            config,
-            turns_receiver,
-            updates_sender,
-        ));
-        let update_task = cx.spawn(async move |this, cx| {
-            while let Ok(update) = updates_receiver.recv().await {
-                if let Err(error) = this.update(cx, |this, cx| {
-                    this.apply_turn_update(update, cx);
-                }) {
-                    log::debug!("failed to apply harness update: {error}");
-                    break;
-                }
-            }
-        });
-
-        self.codex_sessions.insert(
-            thread_id.clone(),
-            CodexSessionHandle {
-                turns: turns_sender.clone(),
-                _session_task: session_task,
-                _update_task: update_task,
-            },
-        );
-        Some(turns_sender)
-    }
-
-    fn prepare_turn_input(
-        &mut self,
-        thread_id: HarnessThreadId,
-        text: String,
-        attachments: Vec<PathBuf>,
-        cx: &mut Context<Self>,
-    ) -> Option<HarnessTurnInput> {
-        let thread = self.thread_mut(&thread_id)?;
-
-        if thread.messages.is_empty() {
-            let attachment_fallback = attachments
-                .first()
-                .map(|first| attachment_display_name(first).to_string());
-            let title_source: &str = if !text.is_empty() {
-                text.as_str()
-            } else if let Some(fallback) = attachment_fallback.as_deref() {
-                fallback
-            } else {
-                "New thread"
-            };
-            thread.title = title_source
-                .lines()
-                .next()
-                .unwrap_or("New thread")
-                .chars()
-                .take(48)
-                .collect::<String>()
-                .into();
-        }
-
-        let combined_input = build_input_with_attachments(&text, &attachments);
-
-        // Pre-turn estimate is only used until codex reports real usage via
-        // turn/completed; once we have real numbers we stop accumulating
-        // guesses.
-        if !thread.has_reported_tokens {
-            thread.estimated_tokens_used += combined_input.len() / 4;
-        }
-        thread.messages.push(TranscriptMessage {
-            role: TranscriptRole::User,
-            text,
-            attachments,
-            started_at: None,
-            duration_ms: None,
-        });
-        thread.run_status = HarnessRunStatus::Connecting;
-        cx.notify();
-
-        Some(HarnessTurnInput {
-            input: combined_input,
-            model: self.selected_model.clone(),
-            reasoning_effort: self.selected_reasoning_effort.clone(),
-            approval_policy: HarnessApprovalPolicy::Never,
-            sandbox_policy: self.selected_sandbox_policy.clone(),
-        })
-    }
-
-    fn apply_turn_update(&mut self, update: HarnessTurnUpdate, cx: &mut Context<Self>) {
-        match update {
-            HarnessTurnUpdate::Status { thread_id, status } => {
-                if let Some(thread) = self.thread_mut(&thread_id)
-                    && !matches!(thread.run_status, HarnessRunStatus::Failed(_))
-                {
-                    thread.run_status = status;
-                }
-            }
-            HarnessTurnUpdate::ThreadReady {
-                thread_id,
-                provider_thread_id,
-            } => {
-                if let Some(thread) = self.thread_mut(&thread_id) {
-                    thread.provider_thread_id = Some(provider_thread_id);
-                }
-            }
-            HarnessTurnUpdate::AssistantDelta { thread_id, delta } => {
-                if let Some(thread) = self.thread_mut(&thread_id) {
-                    thread.run_status = HarnessRunStatus::Running;
-                    if !thread.has_reported_tokens {
-                        thread.estimated_tokens_used += delta.len() / 4;
-                    }
-                    match thread.messages.last_mut() {
-                        Some(message) if matches!(message.role, TranscriptRole::Assistant) => {
-                            message.text.push_str(&delta);
-                        }
-                        _ => thread
-                            .messages
-                            .push(TranscriptMessage::new(TranscriptRole::Assistant, delta)),
-                    }
-                }
-            }
-            HarnessTurnUpdate::ToolEvent {
-                thread_id,
-                item_id,
-                kind,
-                phase,
-                title,
-                detail,
-            } => {
-                if let Some(thread) = self.thread_mut(&thread_id) {
-                    thread.run_status = HarnessRunStatus::Running;
-                    let display_kind = ToolDisplayKind::from_harness(&kind);
-
-                    let existing = thread.messages.iter_mut().rev().find(|message| {
-                        match (&message.role, item_id.as_ref()) {
-                            (
-                                TranscriptRole::Tool {
-                                    item_id: Some(existing_id),
-                                    ..
-                                },
-                                Some(new_id),
-                            ) => existing_id == new_id,
-                            (
-                                TranscriptRole::Tool {
-                                    item_id: None,
-                                    kind: existing_kind,
-                                    title: existing_title,
-                                    status,
-                                    ..
-                                },
-                                None,
-                            ) => {
-                                *existing_kind == display_kind
-                                    && existing_title == &title
-                                    && *status == ToolStatus::Running
-                            }
-                            _ => false,
-                        }
-                    });
-
-                    if let Some(message) = existing {
-                        let mut transitioned_to_terminal = false;
-                        if let TranscriptRole::Tool {
-                            status,
-                            title: existing_title,
-                            ..
-                        } = &mut message.role
-                        {
-                            if !title.is_empty() {
-                                *existing_title = title.clone();
-                            }
-                            let next_status = match phase {
-                                HarnessToolPhase::End => ToolStatus::Completed,
-                                _ => ToolStatus::Running,
-                            };
-                            if *status == ToolStatus::Running
-                                && next_status != ToolStatus::Running
-                            {
-                                transitioned_to_terminal = true;
-                            }
-                            *status = next_status;
-                        }
-                        if transitioned_to_terminal
-                            && message.duration_ms.is_none()
-                            && let Some(started) = message.started_at.take()
-                        {
-                            message.duration_ms =
-                                Some(started.elapsed().as_millis().min(u128::from(u64::MAX))
-                                    as u64);
-                        }
-                        if !detail.is_empty() {
-                            // Codex can ship tool bodies either as pure deltas
-                            // or as cumulative snapshots. Reasoning frequently
-                            // arrives as rolling snapshots; command output
-                            // typically arrives as a single completion-time
-                            // snapshot after any streamed deltas. In both
-                            // cases, if the new payload already contains the
-                            // existing body, treat it as a snapshot and
-                            // replace rather than double-append; otherwise
-                            // treat it as a delta.
-                            let use_snapshot_merge = matches!(
-                                display_kind,
-                                ToolDisplayKind::Reasoning | ToolDisplayKind::Command
-                            );
-                            if use_snapshot_merge
-                                && detail.as_ref().starts_with(message.text.as_str())
-                                && detail.len() >= message.text.len()
-                            {
-                                message.text = detail.to_string();
-                            } else if matches!(display_kind, ToolDisplayKind::Reasoning) {
-                                message.text.push_str(&detail);
-                            } else {
-                                if !message.text.is_empty() {
-                                    message.text.push('\n');
-                                }
-                                message.text.push_str(&detail);
-                            }
-                        }
-                    } else {
-                        let status = match phase {
-                            HarnessToolPhase::End => ToolStatus::Completed,
-                            _ => ToolStatus::Running,
-                        };
-                        let mut new_message = TranscriptMessage::new(
-                            TranscriptRole::Tool {
-                                item_id: item_id.clone(),
-                                kind: display_kind,
-                                status,
-                                title,
-                            },
-                            detail.to_string(),
-                        );
-                        // Only stamp a start time when the tool is actually
-                        // starting — if we get here on a terminal phase with
-                        // no prior Running record, we have no duration to
-                        // derive.
-                        if status == ToolStatus::Running {
-                            new_message.started_at = Some(std::time::Instant::now());
-                        }
-                        thread.messages.push(new_message);
-                    }
-                }
-            }
-            HarnessTurnUpdate::TokensUsed {
-                thread_id,
-                total_tokens,
-            } => {
-                if let Some(thread) = self.thread_mut(&thread_id) {
-                    thread.estimated_tokens_used = total_tokens;
-                    thread.has_reported_tokens = true;
-                }
-            }
-            HarnessTurnUpdate::Finished { thread_id } => {
-                if let Some(thread) = self.thread_mut(&thread_id) {
-                    thread.run_status = HarnessRunStatus::Idle;
-                    for message in thread.messages.iter_mut() {
-                        if let TranscriptRole::Tool { status, .. } = &mut message.role {
-                            if *status == ToolStatus::Running {
-                                *status = ToolStatus::Completed;
-                            }
-                        }
-                    }
-                }
-            }
-            HarnessTurnUpdate::Failed { thread_id, message } => {
-                if let Some(thread) = self.thread_mut(&thread_id) {
-                    thread.run_status = HarnessRunStatus::Failed(message.clone());
-                    for transcript_message in thread.messages.iter_mut() {
-                        if let TranscriptRole::Tool { status, .. } = &mut transcript_message.role {
-                            if *status == ToolStatus::Running {
-                                *status = ToolStatus::Failed;
-                            }
-                        }
-                    }
-                    thread.messages.push(TranscriptMessage::new(
-                        TranscriptRole::System,
-                        format!("Agent failed: {message}"),
-                    ));
-                }
-            }
-        }
-
-        cx.notify();
+    fn pin_to_bottom(&mut self) {
+        self.list_state.set_follow_mode(gpui::FollowMode::Tail);
+        self.list_state.scroll_to_end();
     }
 
     fn handle_agent_url_click(
         &mut self,
         url: &str,
-        workspace_handle: &gpui::WeakEntity<workspace::Workspace>,
+        workspace_handle: &WeakEntity<workspace::Workspace>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -901,20 +359,10 @@ impl AgentsSurface {
                 cx.open_url(url);
             } else {
                 log::warn!("no file in project matched link: {url}");
-                if let Some(thread) = self.active_thread_mut(cx) {
-                    thread.messages.push(TranscriptMessage::new(
-                        TranscriptRole::System,
-                        format!("Could not find file for link: {url}"),
-                    ));
-                    cx.notify();
-                }
             }
             return;
         };
 
-        // Prefer opening through find_project_path so the file lands in the
-        // existing worktree's pane with the correct project metadata; fall
-        // back to open_abs_path for files outside any worktree.
         let project = workspace.read(cx).project().clone();
         let project_path = project.read(cx).find_project_path(&abs_path, cx);
 
@@ -930,348 +378,78 @@ impl AgentsSurface {
             }
         });
 
-        cx.emit(AgentsSurfaceEvent::OpenedInEditor);
+        cx.emit(TranscriptViewEvent::OpenedInEditor);
     }
 
-    fn active_thread_mut(&mut self, cx: &App) -> Option<&mut HarnessThread> {
-        let workspace_path = workspace_storage_key(&self.workspace, cx)?;
-        let thread_id = self.active_thread_by_path.get(&workspace_path).cloned()?;
-        self.thread_mut(&thread_id)
-    }
-
-    fn thread_mut(&mut self, thread_id: &HarnessThreadId) -> Option<&mut HarnessThread> {
-        self.threads_by_path
-            .values_mut()
-            .flat_map(|threads| threads.iter_mut())
-            .find(|thread| &thread.id == thread_id)
-    }
-
-    fn prune_markdown_cache(&mut self) {
-        let mut valid = HashSet::new();
-        for threads in self.threads_by_path.values() {
-            for thread in threads {
-                for index in 0..thread.messages.len() {
-                    valid.insert((thread.id.0.clone(), index));
-                }
-            }
-        }
-        self.markdown_cache.retain(|key, _| valid.contains(key));
-    }
-
-    fn active_thread(&self, cx: &App) -> Option<&HarnessThread> {
-        let workspace_path = workspace_storage_key(&self.workspace, cx)?;
-        let thread_id = self.active_thread_by_path.get(&workspace_path)?;
-        self.threads_by_path
-            .get(&workspace_path)?
-            .iter()
-            .find(|thread| &thread.id == thread_id)
-    }
-
-    pub(crate) fn serialize_threads(&self) -> Vec<SerializedThreadGroup> {
-        self.threads_by_path
-            .iter()
-            .filter_map(|(workspace_path, threads)| {
-                if threads.is_empty() {
-                    return None;
-                }
-                Some(SerializedThreadGroup {
-                    workspace_path: workspace_path.clone(),
-                    active_thread_id: self
-                        .active_thread_by_path
-                        .get(workspace_path)
-                        .map(|id| id.0.to_string()),
-                    threads: threads
-                        .iter()
-                        .map(|thread| SerializedHarnessThread {
-                            id: thread.id.0.to_string(),
-                            provider_thread_id: thread.provider_thread_id.clone(),
-                            title: thread.title.to_string(),
-                            cwd: thread.cwd.clone(),
-                            messages: thread
-                                .messages
-                                .iter()
-                                .map(|message| SerializedTranscriptMessage {
-                                    role: match &message.role {
-                                        TranscriptRole::User => SerializedTranscriptRole::User,
-                                        TranscriptRole::Assistant => {
-                                            SerializedTranscriptRole::Assistant
-                                        }
-                                        TranscriptRole::System => SerializedTranscriptRole::System,
-                                        TranscriptRole::Tool {
-                                            item_id,
-                                            kind,
-                                            status,
-                                            title,
-                                        } => SerializedTranscriptRole::Tool {
-                                            title: title.to_string(),
-                                            item_id: item_id.clone(),
-                                            tool_kind: SerializedToolKind::from_display(*kind),
-                                            status: SerializedToolStatus::from_status(*status),
-                                        },
-                                    },
-                                    text: message.text.clone(),
-                                    attachments: message.attachments.clone(),
-                                    duration_ms: message.duration_ms,
-                                })
-                                .collect(),
-                            estimated_tokens: Some(thread.estimated_tokens_used),
-                            has_reported_tokens: thread.has_reported_tokens,
-                        })
-                        .collect(),
+    fn render_status_indicator(
+        &self,
+        thread: &HarnessThread,
+        _cx: &mut Context<Self>,
+    ) -> AnyElement {
+        h_flex()
+            .gap_2()
+            .items_center()
+            .py_2()
+            .child(
+                Icon::new(IconName::LoadCircle)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted)
+                    .with_rotate_animation(2),
+            )
+            .child(
+                Label::new(match thread.run_status {
+                    HarnessRunStatus::Connecting => "Connecting…",
+                    HarnessRunStatus::Thinking => "Thinking…",
+                    HarnessRunStatus::Running => "Working…",
+                    _ => "Working…",
                 })
-            })
-            .collect()
-    }
-
-    pub(crate) fn restore_threads(&mut self, groups: Vec<SerializedThreadGroup>) {
-        self.threads_by_path.clear();
-        self.active_thread_by_path.clear();
-        self.codex_sessions.clear();
-        let mut max_thread_number: usize = 0;
-
-        for group in groups {
-            let mut threads = Vec::with_capacity(group.threads.len());
-            for serialized in group.threads {
-                if let Some(number) = serialized
-                    .id
-                    .strip_prefix("thread-")
-                    .and_then(|tail| tail.parse::<usize>().ok())
-                {
-                    if number > max_thread_number {
-                        max_thread_number = number;
-                    }
-                }
-
-                let messages = serialized
-                    .messages
-                    .into_iter()
-                    .map(|message| TranscriptMessage {
-                        role: match message.role {
-                            SerializedTranscriptRole::User => TranscriptRole::User,
-                            SerializedTranscriptRole::Assistant => TranscriptRole::Assistant,
-                            SerializedTranscriptRole::System => TranscriptRole::System,
-                            SerializedTranscriptRole::Tool {
-                                title,
-                                item_id,
-                                tool_kind,
-                                status,
-                            } => TranscriptRole::Tool {
-                                item_id,
-                                kind: tool_kind.into_display(),
-                                status: status.into_status(),
-                                title: title.into(),
-                            },
-                        },
-                        text: message.text,
-                        attachments: message.attachments,
-                        started_at: None,
-                        duration_ms: message.duration_ms,
-                    })
-                    .collect();
-
-                threads.push(HarnessThread {
-                    id: HarnessThreadId(serialized.id.into()),
-                    provider_thread_id: serialized.provider_thread_id,
-                    title: serialized.title.into(),
-                    cwd: serialized.cwd,
-                    harness_kind: HarnessKind::Codex,
-                    run_status: HarnessRunStatus::Idle,
-                    messages,
-                    estimated_tokens_used: serialized.estimated_tokens.unwrap_or(0),
-                    has_reported_tokens: serialized.has_reported_tokens,
-                });
-            }
-
-            if !threads.is_empty() {
-                if let Some(active) = group.active_thread_id {
-                    self.active_thread_by_path
-                        .insert(group.workspace_path.clone(), HarnessThreadId(active.into()));
-                }
-                self.threads_by_path.insert(group.workspace_path, threads);
-            }
-        }
-
-        if self.next_thread_number <= max_thread_number {
-            self.next_thread_number = max_thread_number + 1;
-        }
-
-        self.prune_markdown_cache();
-    }
-
-    pub(crate) fn next_thread_number(&self) -> usize {
-        self.next_thread_number
-    }
-
-    pub(crate) fn set_next_thread_number(&mut self, value: usize) {
-        if value > self.next_thread_number {
-            self.next_thread_number = value;
-        }
-    }
-
-    pub(crate) fn selected_model(&self) -> &str {
-        &self.selected_model
-    }
-
-    pub(crate) fn set_selected_model(&mut self, model: String) {
-        self.selected_model = model;
-    }
-
-    pub(crate) fn selected_reasoning_effort(&self) -> &str {
-        &self.selected_reasoning_effort
-    }
-
-    pub(crate) fn set_selected_reasoning_effort(&mut self, effort: String) {
-        self.selected_reasoning_effort = effort;
-    }
-
-    pub(crate) fn selected_sandbox_policy(&self) -> &HarnessSandboxPolicy {
-        &self.selected_sandbox_policy
-    }
-
-    pub(crate) fn set_selected_sandbox_policy(&mut self, policy: HarnessSandboxPolicy) {
-        self.selected_sandbox_policy = policy;
-    }
-}
-
-impl Render for AgentsSurface {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let project_name = workspace_display_name(&self.workspace, cx);
-        let active_thread = self.active_thread(cx).cloned();
-        let titlebar_item = self.workspace.read(cx).titlebar_item();
-        let preview_overlay = self.render_attachment_preview(cx);
-        let colors = cx.theme().colors();
-
-        v_flex()
-            .id("agents-surface")
-            .key_context(COMPOSER_KEY_CONTEXT)
-            .on_action(cx.listener(Self::send_message))
-            .on_action(cx.listener(|_this, _: &ToggleWorkspaceMode, _window, cx| {
-                cx.emit(AgentsSurfaceEvent::ToggleModeRequested);
-            }))
-            .on_action(cx.listener(|_this, _: &NewThread, _window, cx| {
-                cx.emit(AgentsSurfaceEvent::NewThreadRequested);
-            }))
-            .on_action(cx.listener(|_this, _: &ToggleTerminalPanel, _window, cx| {
-                cx.emit(AgentsSurfaceEvent::ToggleTerminalRequested);
-            }))
-            .size_full()
-            .relative()
-            .overflow_hidden()
-            .bg(colors.editor_background)
-            .children(titlebar_item)
-            .child(
-                h_flex()
-                    .h(px(36.0))
-                    .px_4()
-                    .items_center()
-                    .child(Label::new("New thread").size(LabelSize::Small)),
+                .size(LabelSize::Small)
+                .color(Color::Muted),
             )
-            .child(match active_thread {
-                Some(thread) => self.render_transcript(&thread, window, cx),
-                None => self.render_welcome(project_name, cx).into_any_element(),
-            })
-            .child(
-                v_flex()
-                    .items_center()
-                    .pb_5()
-                    .gap_2()
-                    .child(self.render_composer(cx))
-                    .child(self.render_run_controls(cx)),
-            )
-            .children(preview_overlay)
             .into_any_element()
     }
-}
 
-impl AgentsSurface {
-    fn render_transcript(
+    fn render_item(
         &mut self,
-        thread: &HarnessThread,
+        index: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Decide whether to keep the transcript pinned to the bottom. GPUI
-        // applies wheel deltas to the scroll offset before invoking our
-        // re-render, so the offset we read here already reflects the user's
-        // latest scroll position.
-        //
-        // - If the user was being auto-scrolled and has now scrolled up, drop
-        //   out of stick mode so we don't fight their input.
-        // - If they scroll back to the bottom, re-engage stick mode so new
-        //   messages keep appearing without extra clicks.
-        let offset_y = self.transcript_scroll_handle.offset().y;
-        let max_offset_y = self.transcript_scroll_handle.max_offset().y;
-        let at_bottom =
-            max_offset_y <= px(0.0) || (offset_y + max_offset_y).abs() <= px(4.0);
-        if self.stick_to_bottom != at_bottom {
-            self.stick_to_bottom = at_bottom;
-        }
-        if self.stick_to_bottom {
-            self.transcript_scroll_handle.scroll_to_bottom();
+        let Some(thread) = self.active_thread.clone() else {
+            return div().into_any_element();
+        };
+
+        if index == thread.messages.len() {
+            return self.render_status_indicator(&thread, cx);
         }
 
-        let thread_id = thread.id.0.clone();
-        let mut messages = Vec::new();
-        for (index, message) in thread.messages.iter().enumerate() {
-            if should_skip_message(message) {
-                continue;
-            }
-            let show_header = should_show_role_header(index, message, &thread.messages);
-            messages.push(self.render_message(
-                thread_id.clone(),
-                index,
-                message,
-                show_header,
-                window,
-                cx,
-            ));
+        let Some(message) = thread.messages.get(index) else {
+            return div().into_any_element();
+        };
+
+        if should_skip_message(message) {
+            return div().into_any_element();
         }
 
-        let status_indicator = thread.run_status.is_active().then(|| {
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(
-                    Icon::new(IconName::LoadCircle)
-                        .size(IconSize::XSmall)
-                        .color(Color::Muted)
-                        .with_rotate_animation(2),
-                )
-                .child(
-                    Label::new(match thread.run_status {
-                        HarnessRunStatus::Connecting => "Connecting…",
-                        HarnessRunStatus::Thinking => "Thinking…",
-                        HarnessRunStatus::Running => "Working…",
-                        _ => "Working…",
-                    })
-                    .size(LabelSize::Small)
-                    .color(Color::Muted),
-                )
-        });
+        let show_header = should_show_role_header(index, message, &thread.messages);
+        let content = self.render_message(
+            thread.id.0.clone(),
+            index,
+            message,
+            show_header,
+            window,
+            cx,
+        );
 
-        v_flex()
-            .id("agent-transcript-container")
-            .flex_1()
+        h_flex()
             .w_full()
-            .relative()
-            .overflow_hidden()
+            .justify_center()
             .child(
-                v_flex()
-                    .id("agent-transcript-scroll")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.transcript_scroll_handle)
-                    .items_center()
-                    .child(
-                        v_flex()
-                            .w(COMPOSER_WIDTH)
-                            .gap_4()
-                            .py_8()
-                            .children(messages)
-                            .children(status_indicator),
-                    ),
+                div()
+                    .w(COMPOSER_WIDTH)
+                    .py_2()
+                    .child(content),
             )
-            .vertical_scrollbar_for(&self.transcript_scroll_handle, window, cx)
             .into_any_element()
     }
 
@@ -1334,7 +512,7 @@ impl AgentsSurface {
                 cx,
             );
             let style = MarkdownStyle::themed(MarkdownFont::Agent, window, cx);
-            let workspace_handle = self.workspace.downgrade();
+            let workspace_handle = self.workspace.clone();
             let this_weak = cx.entity().downgrade();
             MarkdownElement::new(markdown_entity, style)
                 .on_url_click(move |url, window, cx| {
@@ -1594,8 +772,6 @@ impl AgentsSurface {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
-        // The command string lives in the title ("Run command: {cmd}").
-        // The body contains only stdout/output.
         let command_text: SharedString = title
             .split_once(": ")
             .map(|(_, cmd)| cmd.to_string())
@@ -1681,6 +857,1045 @@ impl AgentsSurface {
         card.into_any_element()
     }
 
+    fn render_message_attachments(
+        &self,
+        thread_id: &SharedString,
+        message_index: usize,
+        attachments: &[PathBuf],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let previews: Vec<AnyElement> = attachments
+            .iter()
+            .enumerate()
+            .map(|(attachment_index, path)| {
+                let display_name = attachment_display_name(path);
+                let full_path: SharedString = path.to_string_lossy().to_string().into();
+                let is_image = is_image_path(path);
+                let element_id = SharedString::from(format!(
+                    "message-attachment-{}-{}-{}",
+                    thread_id, message_index, attachment_index
+                ));
+                let element_id = ElementId::Name(element_id);
+                let clickable_path = path.clone();
+
+                if is_image {
+                    h_flex()
+                        .id(element_id)
+                        .w(px(96.0))
+                        .h(px(96.0))
+                        .flex_shrink_0()
+                        .overflow_hidden()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .cursor_pointer()
+                        .tooltip(Tooltip::text(full_path))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.request_preview(clickable_path.clone(), cx);
+                        }))
+                        .child(
+                            img(path.clone())
+                                .object_fit(ObjectFit::Cover)
+                                .w_full()
+                                .h_full(),
+                        )
+                        .into_any_element()
+                } else {
+                    h_flex()
+                        .id(element_id)
+                        .h(px(28.0))
+                        .gap_1p5()
+                        .px_2()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border_variant)
+                        .bg(colors.element_background)
+                        .items_center()
+                        .tooltip(Tooltip::text(full_path))
+                        .child(
+                            Icon::new(attachment_icon(path))
+                                .size(IconSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(display_name)
+                                .size(LabelSize::Small)
+                                .color(Color::Default)
+                                .truncate(),
+                        )
+                        .into_any_element()
+                }
+            })
+            .collect();
+
+        h_flex()
+            .gap_2()
+            .flex_wrap()
+            .children(previews)
+            .into_any_element()
+    }
+}
+
+impl Render for TranscriptView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.active_thread.is_none() {
+            return div().flex_1().into_any_element();
+        }
+
+        let list_state = self.list_state.clone();
+
+        v_flex()
+            .id("agent-transcript-container")
+            .flex_1()
+            .w_full()
+            .relative()
+            .overflow_hidden()
+            .child(
+                list(self.list_state.clone(), cx.processor(Self::render_item))
+                    .with_sizing_behavior(ListSizingBehavior::Auto)
+                    .size_full(),
+            )
+            .vertical_scrollbar_for(&list_state, _window, cx)
+            .into_any_element()
+    }
+}
+
+impl EventEmitter<TranscriptViewEvent> for TranscriptView {}
+
+pub struct AgentsSurface {
+    workspace: Entity<workspace::Workspace>,
+    composer_editor: Entity<Editor>,
+    transcript_view: Entity<TranscriptView>,
+    pub(crate) active_thread_by_path: HashMap<String, HarnessThreadId>,
+    pub(crate) threads_by_path: HashMap<String, Vec<HarnessThread>>,
+    next_thread_number: usize,
+    pending_attachments: Vec<PathBuf>,
+    previewing_attachment: Option<PathBuf>,
+    selected_model: String,
+    selected_reasoning_effort: String,
+    selected_sandbox_policy: HarnessSandboxPolicy,
+    codex_sessions: HashMap<HarnessThreadId, CodexSessionHandle>,
+    /// Coalesces rapid streaming updates (assistant deltas, tool events) into
+    /// at most one re-render per frame so the composer editor stays responsive
+    /// while a turn is in flight.
+    streaming_notify_task: Option<Task<()>>,
+    _subscriptions: Vec<Subscription>,
+}
+
+const STREAMING_NOTIFY_INTERVAL: Duration = Duration::from_millis(16);
+
+impl AgentsSurface {
+    pub(crate) fn new(
+        multi_workspace: Entity<MultiWorkspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let workspace = multi_workspace.read(cx).workspace().clone();
+        let transcript_view = cx.new(|_| TranscriptView::new(workspace.clone()));
+
+        let composer_editor = cx.new(|cx| {
+            let mut editor = Editor::auto_height(1, 8, window, cx);
+            editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
+            editor.set_placeholder_text(
+                "Ask anything, @ to add files, / for commands",
+                window,
+                cx,
+            );
+            editor.set_show_indent_guides(false, cx);
+            editor.set_cursor_blink(false, cx);
+            editor
+        });
+
+        let active_workspace_subscription = cx.subscribe_in(
+            &multi_workspace,
+            window,
+            |this, multi_workspace, event: &MultiWorkspaceEvent, _window, cx| {
+                if matches!(event, MultiWorkspaceEvent::ActiveWorkspaceChanged) {
+                    this.workspace = multi_workspace.read(cx).workspace().clone();
+                    this.sync_transcript_view(cx);
+                    cx.notify();
+                }
+            },
+        );
+
+        let transcript_subscription = cx.subscribe_in(
+            &transcript_view,
+            window,
+            |this, _, event: &TranscriptViewEvent, _window, cx| match event {
+                TranscriptViewEvent::OpenedInEditor => {
+                    cx.emit(AgentsSurfaceEvent::OpenedInEditor);
+                }
+                TranscriptViewEvent::PreviewRequested(path) => {
+                    this.preview_attachment(path.clone(), cx);
+                }
+            },
+        );
+
+        let mut this = Self {
+            workspace,
+            composer_editor,
+            transcript_view,
+            active_thread_by_path: HashMap::default(),
+            threads_by_path: HashMap::default(),
+            next_thread_number: 1,
+            pending_attachments: Vec::new(),
+            previewing_attachment: None,
+            selected_model: DEFAULT_MODEL.to_string(),
+            selected_reasoning_effort: DEFAULT_REASONING_EFFORT.to_string(),
+            selected_sandbox_policy: HarnessSandboxPolicy::DangerFullAccess,
+            codex_sessions: HashMap::new(),
+            streaming_notify_task: None,
+            _subscriptions: vec![active_workspace_subscription, transcript_subscription],
+        };
+        this.sync_transcript_view(cx);
+        this
+    }
+
+    /// Coalesce rapid streaming updates into at most one re-render per
+    /// STREAMING_NOTIFY_INTERVAL. Use for AssistantDelta/ToolEvent paths that
+    /// would otherwise fire `cx.notify()` once per token.
+    fn schedule_streaming_notify(&mut self, cx: &mut Context<Self>) {
+        if self.streaming_notify_task.is_some() {
+            return;
+        }
+        self.streaming_notify_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(STREAMING_NOTIFY_INTERVAL)
+                .await;
+            this.update(cx, |this, cx| {
+                this.streaming_notify_task = None;
+                this.sync_transcript_view(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn sync_transcript_view(&mut self, cx: &mut Context<Self>) {
+        let workspace = self.workspace.clone();
+        let thread = self.active_thread(cx).cloned();
+        self.transcript_view.update(cx, |transcript_view, cx| {
+            transcript_view.sync_state(workspace, thread, cx);
+        });
+    }
+
+    fn notify_thread_changed(&mut self, cx: &mut Context<Self>) {
+        self.sync_transcript_view(cx);
+        cx.notify();
+    }
+
+    fn add_attachments<I>(&mut self, paths: I, cx: &mut Context<Self>)
+    where
+        I: IntoIterator<Item = PathBuf>,
+    {
+        let mut added = false;
+        for path in paths {
+            if !self
+                .pending_attachments
+                .iter()
+                .any(|existing| existing == &path)
+            {
+                self.pending_attachments.push(path);
+                added = true;
+            }
+        }
+        if added {
+            cx.notify();
+        }
+    }
+
+    fn preview_attachment(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.previewing_attachment = Some(path);
+        cx.notify();
+    }
+
+    fn dismiss_preview(&mut self, cx: &mut Context<Self>) {
+        if self.previewing_attachment.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn composer_editor(&self) -> &Entity<Editor> {
+        &self.composer_editor
+    }
+
+    fn pick_attachments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach files".into()),
+        });
+
+        cx.spawn_in(window, async move |this, cx| {
+            let paths = match receiver.await {
+                Ok(Ok(Some(paths))) => paths,
+                _ => return,
+            };
+
+            this.update(cx, |this, cx| {
+                this.add_attachments(paths, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.pending_attachments.len() {
+            self.pending_attachments.remove(index);
+            cx.notify();
+        }
+    }
+
+    fn focus_composer(&self, window: &mut Window, cx: &mut App) {
+        self.composer_editor
+            .read(cx)
+            .focus_handle(cx)
+            .focus(window, cx);
+    }
+
+    pub(crate) fn thread_summaries_for_workspace_path(
+        &self,
+        workspace_path: &str,
+    ) -> Vec<HarnessThreadSummary> {
+        let active_thread_id = self.active_thread_by_path.get(workspace_path);
+        self.threads_by_path
+            .get(workspace_path)
+            .map(|threads| {
+                threads
+                    .iter()
+                    .map(|thread| HarnessThreadSummary {
+                        id: thread.id.clone(),
+                        title: thread.title.clone(),
+                        harness_kind: thread.harness_kind.clone(),
+                        run_status: thread.run_status.clone(),
+                        is_active: active_thread_id == Some(&thread.id),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn activate_thread(
+        &mut self,
+        workspace: Entity<workspace::Workspace>,
+        thread_id: HarnessThreadId,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(workspace_path) = workspace_storage_key(&workspace, cx) else {
+            return;
+        };
+        self.workspace = workspace;
+        self.active_thread_by_path.insert(workspace_path, thread_id);
+        self.notify_thread_changed(cx);
+    }
+
+    pub(crate) fn start_thread(
+        &mut self,
+        workspace: Entity<workspace::Workspace>,
+        cx: &mut Context<Self>,
+    ) -> Option<HarnessThreadId> {
+        let workspace_path = workspace_storage_key(&workspace, cx)?;
+        self.workspace = workspace.clone();
+        let thread_id = HarnessThreadId(format!("thread-{}", self.next_thread_number).into());
+        self.next_thread_number += 1;
+
+        let thread = HarnessThread {
+            id: thread_id.clone(),
+            provider_thread_id: None,
+            title: "New thread".into(),
+            cwd: workspace_root_path(&workspace, cx)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+            harness_kind: HarnessKind::Codex,
+            run_status: HarnessRunStatus::Idle,
+            messages: Vec::new(),
+            estimated_tokens_used: 0,
+            has_reported_tokens: false,
+        };
+
+        self.threads_by_path
+            .entry(workspace_path.clone())
+            .or_default()
+            .push(thread);
+        self.active_thread_by_path
+            .insert(workspace_path, thread_id.clone());
+        self.notify_thread_changed(cx);
+        Some(thread_id)
+    }
+
+    fn send_message(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_composer(window, cx);
+    }
+
+    fn is_turn_running(&self, cx: &App) -> bool {
+        self.active_thread(cx)
+            .is_some_and(|thread| thread.run_status.is_active())
+    }
+
+    fn stop_active_turn(&mut self, cx: &mut Context<Self>) {
+        let Some(workspace_path) = workspace_storage_key(&self.workspace, cx) else {
+            return;
+        };
+        let Some(thread_id) = self.active_thread_by_path.get(&workspace_path).cloned() else {
+            return;
+        };
+
+        // Drop the active thread's codex session to kill its child process
+        // and cancel the in-flight turn. Other threads' sessions are left
+        // untouched so concurrent runs keep going. The next submit on this
+        // thread will start a fresh session via thread/resume.
+        self.codex_sessions.remove(&thread_id);
+
+        if let Some(thread) = self.thread_mut(&thread_id) {
+            thread.run_status = HarnessRunStatus::Idle;
+            for message in thread.messages.iter_mut() {
+                if let TranscriptRole::Tool { status, .. } = &mut message.role {
+                    if *status == ToolStatus::Running {
+                        *status = ToolStatus::Failed;
+                    }
+                }
+            }
+        }
+        self.notify_thread_changed(cx);
+    }
+
+    fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let has_attachments = !self.pending_attachments.is_empty();
+        let text = self.composer_editor.read(cx).text(cx).trim().to_string();
+
+        if text.is_empty() && !has_attachments {
+            return;
+        }
+
+        let workspace = self.workspace.clone();
+        let Some(workspace_path) = workspace_storage_key(&workspace, cx) else {
+            return;
+        };
+        let thread_id = if let Some(existing) = self.active_thread_by_path.get(&workspace_path) {
+            existing.clone()
+        } else if let Some(new_id) = self.start_thread(workspace, cx) {
+            new_id
+        } else {
+            return;
+        };
+
+        // If the thread is already running a turn, surface a system message
+        // and keep the composer intact so the user can retry after it
+        // finishes rather than losing what they typed.
+        if self
+            .thread_mut(&thread_id)
+            .is_some_and(|thread| thread.run_status.is_active())
+        {
+            if let Some(thread) = self.thread_mut(&thread_id) {
+                thread.messages.push(TranscriptMessage::new(
+                    TranscriptRole::System,
+                    "Agent is already working on this thread. Please wait for this turn to finish."
+                        .to_string(),
+                ));
+            }
+            self.notify_thread_changed(cx);
+            return;
+        }
+
+        self.composer_editor.update(cx, |editor, cx| {
+            editor.clear(window, cx);
+        });
+        let attachments = std::mem::take(&mut self.pending_attachments);
+
+        // Sending a new message re-engages autoscroll so the user always sees
+        // their own turn land at the bottom even if they were scrolled up to
+        // reread earlier context.
+        self.transcript_view.update(cx, |transcript_view, _| {
+            transcript_view.pin_to_bottom();
+        });
+
+        let Some(turn_input) =
+            self.prepare_turn_input(thread_id.clone(), text, attachments, cx)
+        else {
+            return;
+        };
+
+        let Some(session_sender) = self.ensure_codex_session(&thread_id, cx) else {
+            return;
+        };
+        if session_sender.try_send(turn_input).is_err() {
+            if let Some(thread) = self.thread_mut(&thread_id) {
+                thread.run_status = HarnessRunStatus::Failed("codex session closed".into());
+                thread.messages.push(TranscriptMessage::new(
+                    TranscriptRole::System,
+                    "Agent session closed unexpectedly. Please try again.".to_string(),
+                ));
+            }
+            self.codex_sessions.remove(&thread_id);
+            self.notify_thread_changed(cx);
+        }
+    }
+
+    fn ensure_codex_session(
+        &mut self,
+        thread_id: &HarnessThreadId,
+        cx: &mut Context<Self>,
+    ) -> Option<channel::Sender<HarnessTurnInput>> {
+        if let Some(session) = self.codex_sessions.get(thread_id) {
+            if !session.turns.is_closed() {
+                return Some(session.turns.clone());
+            }
+            self.codex_sessions.remove(thread_id);
+        }
+
+        let thread = self
+            .threads_by_path
+            .values()
+            .flat_map(|threads| threads.iter())
+            .find(|thread| &thread.id == thread_id)?;
+
+        let config = HarnessSessionConfig {
+            thread_id: thread_id.clone(),
+            provider_thread_id: thread.provider_thread_id.clone(),
+            cwd: thread.cwd.clone(),
+            model: self.selected_model.clone(),
+            approval_policy: HarnessApprovalPolicy::Never,
+            sandbox_policy: self.selected_sandbox_policy.clone(),
+        };
+
+        let (turns_sender, turns_receiver) = channel::unbounded();
+        let (updates_sender, updates_receiver) = channel::unbounded();
+        let session_task = cx.background_spawn(run_codex_app_server_session(
+            config,
+            turns_receiver,
+            updates_sender,
+        ));
+        let update_task = cx.spawn(async move |this, cx| {
+            while let Ok(update) = updates_receiver.recv().await {
+                if let Err(error) = this.update(cx, |this, cx| {
+                    this.apply_turn_update(update, cx);
+                }) {
+                    log::debug!("failed to apply harness update: {error}");
+                    break;
+                }
+            }
+        });
+
+        self.codex_sessions.insert(
+            thread_id.clone(),
+            CodexSessionHandle {
+                turns: turns_sender.clone(),
+                _session_task: session_task,
+                _update_task: update_task,
+            },
+        );
+        Some(turns_sender)
+    }
+
+    fn prepare_turn_input(
+        &mut self,
+        thread_id: HarnessThreadId,
+        text: String,
+        attachments: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) -> Option<HarnessTurnInput> {
+        let thread = self.thread_mut(&thread_id)?;
+
+        if thread.messages.is_empty() {
+            let attachment_fallback = attachments
+                .first()
+                .map(|first| attachment_display_name(first).to_string());
+            let title_source: &str = if !text.is_empty() {
+                text.as_str()
+            } else if let Some(fallback) = attachment_fallback.as_deref() {
+                fallback
+            } else {
+                "New thread"
+            };
+            thread.title = title_source
+                .lines()
+                .next()
+                .unwrap_or("New thread")
+                .chars()
+                .take(48)
+                .collect::<String>()
+                .into();
+        }
+
+        let combined_input = build_input_with_attachments(&text, &attachments);
+
+        // Pre-turn estimate is only used until codex reports real usage via
+        // turn/completed; once we have real numbers we stop accumulating
+        // guesses.
+        if !thread.has_reported_tokens {
+            thread.estimated_tokens_used += combined_input.len() / 4;
+        }
+        thread.messages.push(TranscriptMessage {
+            role: TranscriptRole::User,
+            text,
+            attachments,
+            started_at: None,
+            duration_ms: None,
+        });
+        thread.run_status = HarnessRunStatus::Connecting;
+        self.notify_thread_changed(cx);
+
+        Some(HarnessTurnInput {
+            input: combined_input,
+            model: self.selected_model.clone(),
+            reasoning_effort: self.selected_reasoning_effort.clone(),
+            approval_policy: HarnessApprovalPolicy::Never,
+            sandbox_policy: self.selected_sandbox_policy.clone(),
+        })
+    }
+
+    fn apply_turn_update(&mut self, update: HarnessTurnUpdate, cx: &mut Context<Self>) {
+        // Streaming updates (assistant deltas, tool events) can fire once per
+        // token. Coalesce those into a throttled re-render; all other updates
+        // are infrequent enough that an immediate notify keeps the UI snappy.
+        let is_streaming = matches!(
+            &update,
+            HarnessTurnUpdate::AssistantDelta { .. } | HarnessTurnUpdate::ToolEvent { .. }
+        );
+
+        match update {
+            HarnessTurnUpdate::Status { thread_id, status } => {
+                if let Some(thread) = self.thread_mut(&thread_id)
+                    && !matches!(thread.run_status, HarnessRunStatus::Failed(_))
+                {
+                    thread.run_status = status;
+                }
+            }
+            HarnessTurnUpdate::ThreadReady {
+                thread_id,
+                provider_thread_id,
+            } => {
+                if let Some(thread) = self.thread_mut(&thread_id) {
+                    thread.provider_thread_id = Some(provider_thread_id);
+                }
+            }
+            HarnessTurnUpdate::AssistantDelta { thread_id, delta } => {
+                if let Some(thread) = self.thread_mut(&thread_id) {
+                    thread.run_status = HarnessRunStatus::Running;
+                    if !thread.has_reported_tokens {
+                        thread.estimated_tokens_used += delta.len() / 4;
+                    }
+                    match thread.messages.last_mut() {
+                        Some(message) if matches!(message.role, TranscriptRole::Assistant) => {
+                            message.text.push_str(&delta);
+                        }
+                        _ => thread
+                            .messages
+                            .push(TranscriptMessage::new(TranscriptRole::Assistant, delta)),
+                    }
+                }
+            }
+            HarnessTurnUpdate::ToolEvent {
+                thread_id,
+                item_id,
+                kind,
+                phase,
+                title,
+                detail,
+            } => {
+                if let Some(thread) = self.thread_mut(&thread_id) {
+                    thread.run_status = HarnessRunStatus::Running;
+                    let display_kind = ToolDisplayKind::from_harness(&kind);
+
+                    let existing = thread.messages.iter_mut().rev().find(|message| {
+                        match (&message.role, item_id.as_ref()) {
+                            (
+                                TranscriptRole::Tool {
+                                    item_id: Some(existing_id),
+                                    ..
+                                },
+                                Some(new_id),
+                            ) => existing_id == new_id,
+                            (
+                                TranscriptRole::Tool {
+                                    item_id: None,
+                                    kind: existing_kind,
+                                    title: existing_title,
+                                    status,
+                                    ..
+                                },
+                                None,
+                            ) => {
+                                *existing_kind == display_kind
+                                    && existing_title == &title
+                                    && *status == ToolStatus::Running
+                            }
+                            _ => false,
+                        }
+                    });
+
+                    if let Some(message) = existing {
+                        let mut transitioned_to_terminal = false;
+                        if let TranscriptRole::Tool {
+                            status,
+                            title: existing_title,
+                            ..
+                        } = &mut message.role
+                        {
+                            if !title.is_empty() {
+                                *existing_title = title.clone();
+                            }
+                            let next_status = match phase {
+                                HarnessToolPhase::End => ToolStatus::Completed,
+                                _ => ToolStatus::Running,
+                            };
+                            if *status == ToolStatus::Running
+                                && next_status != ToolStatus::Running
+                            {
+                                transitioned_to_terminal = true;
+                            }
+                            *status = next_status;
+                        }
+                        if transitioned_to_terminal
+                            && message.duration_ms.is_none()
+                            && let Some(started) = message.started_at.take()
+                        {
+                            message.duration_ms =
+                                Some(started.elapsed().as_millis().min(u128::from(u64::MAX))
+                                    as u64);
+                        }
+                        if !detail.is_empty() {
+                            // Codex can ship tool bodies either as pure deltas
+                            // or as cumulative snapshots. Reasoning frequently
+                            // arrives as rolling snapshots; command output
+                            // typically arrives as a single completion-time
+                            // snapshot after any streamed deltas. In both
+                            // cases, if the new payload already contains the
+                            // existing body, treat it as a snapshot and
+                            // replace rather than double-append; otherwise
+                            // treat it as a delta.
+                            let use_snapshot_merge = matches!(
+                                display_kind,
+                                ToolDisplayKind::Reasoning | ToolDisplayKind::Command
+                            );
+                            if use_snapshot_merge
+                                && detail.as_ref().starts_with(message.text.as_str())
+                                && detail.len() >= message.text.len()
+                            {
+                                message.text = detail.to_string();
+                            } else if matches!(display_kind, ToolDisplayKind::Reasoning) {
+                                message.text.push_str(&detail);
+                            } else {
+                                if !message.text.is_empty() {
+                                    message.text.push('\n');
+                                }
+                                message.text.push_str(&detail);
+                            }
+                        }
+                    } else {
+                        let status = match phase {
+                            HarnessToolPhase::End => ToolStatus::Completed,
+                            _ => ToolStatus::Running,
+                        };
+                        let mut new_message = TranscriptMessage::new(
+                            TranscriptRole::Tool {
+                                item_id: item_id.clone(),
+                                kind: display_kind,
+                                status,
+                                title,
+                            },
+                            detail.to_string(),
+                        );
+                        // Only stamp a start time when the tool is actually
+                        // starting — if we get here on a terminal phase with
+                        // no prior Running record, we have no duration to
+                        // derive.
+                        if status == ToolStatus::Running {
+                            new_message.started_at = Some(std::time::Instant::now());
+                        }
+                        thread.messages.push(new_message);
+                    }
+                }
+            }
+            HarnessTurnUpdate::TokensUsed {
+                thread_id,
+                total_tokens,
+            } => {
+                if let Some(thread) = self.thread_mut(&thread_id) {
+                    thread.estimated_tokens_used = total_tokens;
+                    thread.has_reported_tokens = true;
+                }
+            }
+            HarnessTurnUpdate::Finished { thread_id } => {
+                if let Some(thread) = self.thread_mut(&thread_id) {
+                    thread.run_status = HarnessRunStatus::Idle;
+                    for message in thread.messages.iter_mut() {
+                        if let TranscriptRole::Tool { status, .. } = &mut message.role {
+                            if *status == ToolStatus::Running {
+                                *status = ToolStatus::Completed;
+                            }
+                        }
+                    }
+                }
+            }
+            HarnessTurnUpdate::Failed { thread_id, message } => {
+                if let Some(thread) = self.thread_mut(&thread_id) {
+                    thread.run_status = HarnessRunStatus::Failed(message.clone());
+                    for transcript_message in thread.messages.iter_mut() {
+                        if let TranscriptRole::Tool { status, .. } = &mut transcript_message.role {
+                            if *status == ToolStatus::Running {
+                                *status = ToolStatus::Failed;
+                            }
+                        }
+                    }
+                    thread.messages.push(TranscriptMessage::new(
+                        TranscriptRole::System,
+                        format!("Agent failed: {message}"),
+                    ));
+                }
+            }
+        }
+
+        if is_streaming {
+            self.schedule_streaming_notify(cx);
+        } else {
+            // Also flush any pending throttled notify so this immediate
+            // notify subsumes it.
+            self.streaming_notify_task = None;
+            self.notify_thread_changed(cx);
+        }
+    }
+
+    fn thread_mut(&mut self, thread_id: &HarnessThreadId) -> Option<&mut HarnessThread> {
+        self.threads_by_path
+            .values_mut()
+            .flat_map(|threads| threads.iter_mut())
+            .find(|thread| &thread.id == thread_id)
+    }
+
+    fn active_thread(&self, cx: &App) -> Option<&HarnessThread> {
+        let workspace_path = workspace_storage_key(&self.workspace, cx)?;
+        let thread_id = self.active_thread_by_path.get(&workspace_path)?;
+        self.threads_by_path
+            .get(&workspace_path)?
+            .iter()
+            .find(|thread| &thread.id == thread_id)
+    }
+
+    pub(crate) fn serialize_threads(&self) -> Vec<SerializedThreadGroup> {
+        self.threads_by_path
+            .iter()
+            .filter_map(|(workspace_path, threads)| {
+                if threads.is_empty() {
+                    return None;
+                }
+                Some(SerializedThreadGroup {
+                    workspace_path: workspace_path.clone(),
+                    active_thread_id: self
+                        .active_thread_by_path
+                        .get(workspace_path)
+                        .map(|id| id.0.to_string()),
+                    threads: threads
+                        .iter()
+                        .map(|thread| SerializedHarnessThread {
+                            id: thread.id.0.to_string(),
+                            provider_thread_id: thread.provider_thread_id.clone(),
+                            title: thread.title.to_string(),
+                            cwd: thread.cwd.clone(),
+                            messages: thread
+                                .messages
+                                .iter()
+                                .map(|message| SerializedTranscriptMessage {
+                                    role: match &message.role {
+                                        TranscriptRole::User => SerializedTranscriptRole::User,
+                                        TranscriptRole::Assistant => {
+                                            SerializedTranscriptRole::Assistant
+                                        }
+                                        TranscriptRole::System => SerializedTranscriptRole::System,
+                                        TranscriptRole::Tool {
+                                            item_id,
+                                            kind,
+                                            status,
+                                            title,
+                                        } => SerializedTranscriptRole::Tool {
+                                            title: title.to_string(),
+                                            item_id: item_id.clone(),
+                                            tool_kind: SerializedToolKind::from_display(*kind),
+                                            status: SerializedToolStatus::from_status(*status),
+                                        },
+                                    },
+                                    text: message.text.clone(),
+                                    attachments: message.attachments.clone(),
+                                    duration_ms: message.duration_ms,
+                                })
+                                .collect(),
+                            estimated_tokens: Some(thread.estimated_tokens_used),
+                            has_reported_tokens: thread.has_reported_tokens,
+                        })
+                        .collect(),
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn restore_threads(
+        &mut self,
+        groups: Vec<SerializedThreadGroup>,
+        cx: &mut Context<Self>,
+    ) {
+        self.threads_by_path.clear();
+        self.active_thread_by_path.clear();
+        self.codex_sessions.clear();
+        let mut max_thread_number: usize = 0;
+
+        for group in groups {
+            let mut threads = Vec::with_capacity(group.threads.len());
+            for serialized in group.threads {
+                if let Some(number) = serialized
+                    .id
+                    .strip_prefix("thread-")
+                    .and_then(|tail| tail.parse::<usize>().ok())
+                {
+                    if number > max_thread_number {
+                        max_thread_number = number;
+                    }
+                }
+
+                let messages = serialized
+                    .messages
+                    .into_iter()
+                    .map(|message| TranscriptMessage {
+                        role: match message.role {
+                            SerializedTranscriptRole::User => TranscriptRole::User,
+                            SerializedTranscriptRole::Assistant => TranscriptRole::Assistant,
+                            SerializedTranscriptRole::System => TranscriptRole::System,
+                            SerializedTranscriptRole::Tool {
+                                title,
+                                item_id,
+                                tool_kind,
+                                status,
+                            } => TranscriptRole::Tool {
+                                item_id,
+                                kind: tool_kind.into_display(),
+                                status: status.into_status(),
+                                title: title.into(),
+                            },
+                        },
+                        text: message.text,
+                        attachments: message.attachments,
+                        started_at: None,
+                        duration_ms: message.duration_ms,
+                    })
+                    .collect();
+
+                threads.push(HarnessThread {
+                    id: HarnessThreadId(serialized.id.into()),
+                    provider_thread_id: serialized.provider_thread_id,
+                    title: serialized.title.into(),
+                    cwd: serialized.cwd,
+                    harness_kind: HarnessKind::Codex,
+                    run_status: HarnessRunStatus::Idle,
+                    messages,
+                    estimated_tokens_used: serialized.estimated_tokens.unwrap_or(0),
+                    has_reported_tokens: serialized.has_reported_tokens,
+                });
+            }
+
+            if !threads.is_empty() {
+                if let Some(active) = group.active_thread_id {
+                    self.active_thread_by_path
+                        .insert(group.workspace_path.clone(), HarnessThreadId(active.into()));
+                }
+                self.threads_by_path.insert(group.workspace_path, threads);
+            }
+        }
+
+        if self.next_thread_number <= max_thread_number {
+            self.next_thread_number = max_thread_number + 1;
+        }
+
+        self.sync_transcript_view(cx);
+    }
+
+    pub(crate) fn next_thread_number(&self) -> usize {
+        self.next_thread_number
+    }
+
+    pub(crate) fn set_next_thread_number(&mut self, value: usize) {
+        if value > self.next_thread_number {
+            self.next_thread_number = value;
+        }
+    }
+
+    pub(crate) fn selected_model(&self) -> &str {
+        &self.selected_model
+    }
+
+    pub(crate) fn set_selected_model(&mut self, model: String) {
+        self.selected_model = model;
+    }
+
+    pub(crate) fn selected_reasoning_effort(&self) -> &str {
+        &self.selected_reasoning_effort
+    }
+
+    pub(crate) fn set_selected_reasoning_effort(&mut self, effort: String) {
+        self.selected_reasoning_effort = effort;
+    }
+
+    pub(crate) fn selected_sandbox_policy(&self) -> &HarnessSandboxPolicy {
+        &self.selected_sandbox_policy
+    }
+
+    pub(crate) fn set_selected_sandbox_policy(&mut self, policy: HarnessSandboxPolicy) {
+        self.selected_sandbox_policy = policy;
+    }
+}
+
+impl Render for AgentsSurface {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let project_name = workspace_display_name(&self.workspace, cx);
+        let has_active_thread = self.active_thread(cx).is_some();
+        let titlebar_item = self.workspace.read(cx).titlebar_item();
+        let preview_overlay = self.render_attachment_preview(cx);
+        let colors = cx.theme().colors();
+
+        v_flex()
+            .id("agents-surface")
+            .key_context(COMPOSER_KEY_CONTEXT)
+            .on_action(cx.listener(Self::send_message))
+            .on_action(cx.listener(|_this, _: &ToggleWorkspaceMode, _window, cx| {
+                cx.emit(AgentsSurfaceEvent::ToggleModeRequested);
+            }))
+            .on_action(cx.listener(|_this, _: &NewThread, _window, cx| {
+                cx.emit(AgentsSurfaceEvent::NewThreadRequested);
+            }))
+            .on_action(cx.listener(|_this, _: &ToggleTerminalPanel, _window, cx| {
+                cx.emit(AgentsSurfaceEvent::ToggleTerminalRequested);
+            }))
+            .size_full()
+            .relative()
+            .overflow_hidden()
+            .bg(colors.editor_background)
+            .children(titlebar_item)
+            .child(
+                h_flex()
+                    .h(px(36.0))
+                    .px_4()
+                    .items_center()
+                    .child(Label::new("New thread").size(LabelSize::Small)),
+            )
+            .child(if has_active_thread {
+                self.transcript_view.clone().into_any_element()
+            } else {
+                self.render_welcome(project_name, cx).into_any_element()
+            })
+            .child(
+                v_flex()
+                    .items_center()
+                    .pb_5()
+                    .gap_2()
+                    .child(self.render_composer(cx))
+                    .child(self.render_run_controls(cx)),
+            )
+            .children(preview_overlay)
+            .into_any_element()
+    }
+}
+
+impl AgentsSurface {
     fn render_welcome(
         &self,
         project_name: SharedString,
@@ -1899,85 +2114,6 @@ impl AgentsSurface {
             .gap_2()
             .flex_wrap()
             .children(chips)
-            .into_any_element()
-    }
-
-    fn render_message_attachments(
-        &self,
-        thread_id: &SharedString,
-        message_index: usize,
-        attachments: &[PathBuf],
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let colors = cx.theme().colors();
-        let previews: Vec<AnyElement> = attachments
-            .iter()
-            .enumerate()
-            .map(|(attachment_index, path)| {
-                let display_name = attachment_display_name(path);
-                let full_path: SharedString = path.to_string_lossy().to_string().into();
-                let is_image = is_image_path(path);
-                let element_id = SharedString::from(format!(
-                    "message-attachment-{}-{}-{}",
-                    thread_id, message_index, attachment_index
-                ));
-                let element_id = ElementId::Name(element_id);
-                let clickable_path = path.clone();
-
-                if is_image {
-                    h_flex()
-                        .id(element_id)
-                        .w(px(96.0))
-                        .h(px(96.0))
-                        .flex_shrink_0()
-                        .overflow_hidden()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(colors.border_variant)
-                        .cursor_pointer()
-                        .tooltip(Tooltip::text(full_path))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.preview_attachment(clickable_path.clone(), cx);
-                        }))
-                        .child(
-                            img(path.clone())
-                                .object_fit(ObjectFit::Cover)
-                                .w_full()
-                                .h_full(),
-                        )
-                        .into_any_element()
-                } else {
-                    h_flex()
-                        .id(element_id)
-                        .h(px(28.0))
-                        .gap_1p5()
-                        .px_2()
-                        .rounded_md()
-                        .border_1()
-                        .border_color(colors.border_variant)
-                        .bg(colors.element_background)
-                        .items_center()
-                        .tooltip(Tooltip::text(full_path))
-                        .child(
-                            Icon::new(attachment_icon(path))
-                                .size(IconSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Label::new(display_name)
-                                .size(LabelSize::Small)
-                                .color(Color::Default)
-                                .truncate(),
-                        )
-                        .into_any_element()
-                }
-            })
-            .collect();
-
-        h_flex()
-            .gap_2()
-            .flex_wrap()
-            .children(previews)
             .into_any_element()
     }
 
@@ -2363,4 +2499,3 @@ impl AgentsSurface {
 }
 
 impl EventEmitter<AgentsSurfaceEvent> for AgentsSurface {}
-

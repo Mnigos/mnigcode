@@ -14,6 +14,7 @@ pub struct BlinkManager {
     enabled: bool,
     /// Whether the blinking is enabled in the settings.
     blink_enabled_in_settings: fn(&App) -> bool,
+    blink_enabled_override: Option<bool>,
 }
 
 impl BlinkManager {
@@ -35,7 +36,13 @@ impl BlinkManager {
             visible: true,
             enabled: false,
             blink_enabled_in_settings,
+            blink_enabled_override: None,
         }
+    }
+
+    fn blinking_enabled(&self, cx: &App) -> bool {
+        self.blink_enabled_override
+            .unwrap_or_else(|| (self.blink_enabled_in_settings)(cx))
     }
 
     fn next_blink_epoch(&mut self) -> usize {
@@ -63,7 +70,7 @@ impl BlinkManager {
     }
 
     fn blink_cursors(&mut self, epoch: usize, cx: &mut Context<Self>) {
-        if (self.blink_enabled_in_settings)(cx) {
+        if self.blinking_enabled(cx) {
             if epoch == self.blink_epoch && self.enabled && !self.blinking_paused {
                 self.visible = !self.visible;
                 cx.notify();
@@ -80,6 +87,18 @@ impl BlinkManager {
             }
         } else {
             self.show_cursor(cx);
+        }
+    }
+
+    pub fn set_blink_enabled_override(
+        &mut self,
+        blink_enabled_override: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
+        self.blink_enabled_override = blink_enabled_override;
+        if self.enabled {
+            self.show_cursor(cx);
+            self.blink_cursors(self.blink_epoch, cx);
         }
     }
 
