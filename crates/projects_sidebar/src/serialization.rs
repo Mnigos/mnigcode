@@ -10,6 +10,8 @@ pub(crate) struct SerializedProjectsSidebar {
     #[serde(default)]
     pub(crate) thread_groups: Vec<SerializedThreadGroup>,
     #[serde(default)]
+    pub(crate) project_path_groups: Vec<Vec<PathBuf>>,
+    #[serde(default)]
     pub(crate) next_thread_number: usize,
     #[serde(default)]
     pub(crate) selected_model: Option<String>,
@@ -78,6 +80,7 @@ pub(crate) enum SerializedToolKind {
     FileChange,
     WebSearch,
     Reasoning,
+    McpToolCall,
 }
 
 impl SerializedToolKind {
@@ -88,6 +91,7 @@ impl SerializedToolKind {
             ToolDisplayKind::FileChange => Self::FileChange,
             ToolDisplayKind::WebSearch => Self::WebSearch,
             ToolDisplayKind::Reasoning => Self::Reasoning,
+            ToolDisplayKind::McpToolCall => Self::McpToolCall,
             ToolDisplayKind::Other => Self::Other,
         }
     }
@@ -99,6 +103,7 @@ impl SerializedToolKind {
             Self::FileChange => ToolDisplayKind::FileChange,
             Self::WebSearch => ToolDisplayKind::WebSearch,
             Self::Reasoning => ToolDisplayKind::Reasoning,
+            Self::McpToolCall => ToolDisplayKind::McpToolCall,
             Self::Other => ToolDisplayKind::Other,
         }
     }
