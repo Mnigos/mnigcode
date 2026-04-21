@@ -1,4 +1,5 @@
 use gpui::SharedString;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::time::Instant;
 use ui::IconName;
@@ -32,6 +33,7 @@ pub(crate) struct TranscriptMessage {
     pub(crate) role: TranscriptRole,
     pub(crate) text: String,
     pub(crate) attachments: Vec<PathBuf>,
+    pub(crate) file_mentions: Vec<ResolvedFileMention>,
     /// Wall-clock start time captured when the tool message first lands in
     /// the transcript. Only set for Tool messages; kept in-memory so the
     /// renderer can show "Thought for Xs" once the tool completes.
@@ -48,10 +50,17 @@ impl TranscriptMessage {
             role,
             text,
             attachments: Vec::new(),
+            file_mentions: Vec::new(),
             started_at: None,
             duration_ms: None,
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedFileMention {
+    pub(crate) source_range: Range<usize>,
+    pub(crate) abs_path: PathBuf,
 }
 
 #[derive(Clone)]

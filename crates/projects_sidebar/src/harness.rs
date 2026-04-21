@@ -6,10 +6,13 @@ use futures::{
 use gpui::SharedString;
 use serde_json::{Value, json};
 use smol::{
+    Timer,
     channel::{Receiver, Sender},
     process::Command,
 };
-use std::{path::PathBuf, process::Stdio};
+use std::{future::Future, path::PathBuf, process::Stdio, time::Duration};
+
+const APP_SERVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct HarnessThreadId(pub SharedString);
@@ -187,9 +190,9 @@ pub async fn load_codex_available_skills(cwd: PathBuf) -> Result<Vec<HarnessSkil
         .stderr(Stdio::null())
         .kill_on_drop(true);
 
-    let mut child = command.spawn().with_context(|| {
-        format!("failed to start `codex app-server` in {}", cwd.display())
-    })?;
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start `codex app-server` in {}", cwd.display()))?;
 
     let stdin = child
         .stdin
@@ -224,7 +227,12 @@ pub async fn load_codex_available_skills(cwd: PathBuf) -> Result<Vec<HarnessSkil
         }),
     )
     .await?;
-    read_until_app_server_response(&mut reader, &mut writer, initialize_id).await?;
+    await_app_server_response(
+        &mut child,
+        "initialize response",
+        read_until_app_server_response(&mut reader, &mut writer, initialize_id),
+    )
+    .await?;
 
     write_message(
         &mut writer,
@@ -248,7 +256,12 @@ pub async fn load_codex_available_skills(cwd: PathBuf) -> Result<Vec<HarnessSkil
         }),
     )
     .await?;
-    let skills_result = read_until_app_server_response(&mut reader, &mut writer, skills_id).await?;
+    let skills_result = await_app_server_response(
+        &mut child,
+        "skills/list response",
+        read_until_app_server_response(&mut reader, &mut writer, skills_id),
+    )
+    .await?;
 
     let mut skills = Vec::new();
     append_codex_skills(&mut skills, &skills_result);
@@ -256,6 +269,31 @@ pub async fn load_codex_available_skills(cwd: PathBuf) -> Result<Vec<HarnessSkil
     child.kill().ok();
     deduplicate_skills(&mut skills);
     Ok(skills)
+}
+
+async fn await_app_server_response<Fut, T>(
+    child: &mut smol::process::Child,
+    description: &'static str,
+    future: Fut,
+) -> Result<T>
+where
+    Fut: Future<Output = Result<T>>,
+{
+    match smol::future::or(future, async {
+        Timer::after(APP_SERVER_RESPONSE_TIMEOUT).await;
+        Err(anyhow!(
+            "timed out waiting for codex app-server {description} after {:?}",
+            APP_SERVER_RESPONSE_TIMEOUT
+        ))
+    })
+    .await
+    {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            child.kill().ok();
+            Err(error)
+        }
+    }
 }
 
 async fn run_codex_app_server_session_impl(
@@ -327,12 +365,16 @@ async fn run_codex_app_server_session_impl(
         }),
     )
     .await?;
-    read_until_response(
-        &mut reader,
-        &mut writer,
-        initialize_id,
-        &config.thread_id,
-        updates,
+    await_app_server_response(
+        &mut child,
+        "initialize response",
+        read_until_response(
+            &mut reader,
+            &mut writer,
+            initialize_id,
+            &config.thread_id,
+            updates,
+        ),
     )
     .await?;
 
@@ -374,12 +416,16 @@ async fn run_codex_app_server_session_impl(
         })
     };
     write_message(&mut writer, thread_open_message).await?;
-    let thread_open_result = read_until_response(
-        &mut reader,
-        &mut writer,
-        thread_open_id,
-        &config.thread_id,
-        updates,
+    let thread_open_result = await_app_server_response(
+        &mut child,
+        "thread open response",
+        read_until_response(
+            &mut reader,
+            &mut writer,
+            thread_open_id,
+            &config.thread_id,
+            updates,
+        ),
     )
     .await?;
     let provider_thread_id = read_thread_id(&thread_open_result)
@@ -435,20 +481,19 @@ async fn run_codex_app_server_session_impl(
             }),
         )
         .await?;
-        read_until_response(
-            &mut reader,
-            &mut writer,
-            turn_start_id,
-            &config.thread_id,
-            updates,
+        await_app_server_response(
+            &mut child,
+            "turn/start response",
+            read_until_response(
+                &mut reader,
+                &mut writer,
+                turn_start_id,
+                &config.thread_id,
+                updates,
+            ),
         )
         .await?;
-        send_status(
-            updates,
-            config.thread_id.clone(),
-            HarnessRunStatus::Running,
-        )
-        .await;
+        send_status(updates, config.thread_id.clone(), HarnessRunStatus::Running).await;
 
         read_until_turn_finished(&mut reader, &mut writer, &config.thread_id, updates).await?;
     }
@@ -686,7 +731,9 @@ async fn handle_notification(
         // `item/...` namespace. Funnel those into a Reasoning ToolEvent so
         // the transcript can render them.
         other
-            if other.contains("reasoning") || other.contains("thinking") || other.contains("thought") =>
+            if other.contains("reasoning")
+                || other.contains("thinking")
+                || other.contains("thought") =>
         {
             let phase = if other.ends_with("/delta") || other.ends_with("/update") {
                 HarnessToolPhase::Update
@@ -749,7 +796,9 @@ fn parse_tool_event(method: &str, params: Option<&Value>) -> Option<ParsedToolEv
     // `item/completed` events with `params.item.type == "agentMessage"` that we
     // *should* drop so we don't double-render assistant text as a tool block.
     let item_payload = params.and_then(|params| params.get("item"));
-    let item_type = item_payload.and_then(|item| item.get("type")).and_then(Value::as_str);
+    let item_type = item_payload
+        .and_then(|item| item.get("type"))
+        .and_then(Value::as_str);
     if matches!(
         item_type,
         Some("agentMessage" | "agent_message" | "userMessage" | "user_message")
@@ -927,27 +976,19 @@ fn extract_tool_detail(
 
 fn command_string(params: &Value, item_payload: Option<&Value>) -> Option<String> {
     // String form: { "command": "ls -la" }
-    if let Some(cmd) = params
-        .get("command")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            item_payload
-                .and_then(|item| item.get("command"))
-                .and_then(Value::as_str)
-        })
-    {
+    if let Some(cmd) = params.get("command").and_then(Value::as_str).or_else(|| {
+        item_payload
+            .and_then(|item| item.get("command"))
+            .and_then(Value::as_str)
+    }) {
         return Some(cmd.to_string());
     }
     // Array form: { "command": ["ls", "-la"] }
-    if let Some(array) = params
-        .get("command")
-        .and_then(Value::as_array)
-        .or_else(|| {
-            item_payload
-                .and_then(|item| item.get("command"))
-                .and_then(Value::as_array)
-        })
-    {
+    if let Some(array) = params.get("command").and_then(Value::as_array).or_else(|| {
+        item_payload
+            .and_then(|item| item.get("command"))
+            .and_then(Value::as_array)
+    }) {
         let joined = array
             .iter()
             .filter_map(|value| value.as_str())
@@ -958,15 +999,11 @@ fn command_string(params: &Value, item_payload: Option<&Value>) -> Option<String
         }
     }
     // Zed-style command execution: { "item": { "input": "..." } }
-    if let Some(input) = params
-        .get("input")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            item_payload
-                .and_then(|item| item.get("input"))
-                .and_then(Value::as_str)
-        })
-    {
+    if let Some(input) = params.get("input").and_then(Value::as_str).or_else(|| {
+        item_payload
+            .and_then(|item| item.get("input"))
+            .and_then(Value::as_str)
+    }) {
         return Some(input.to_string());
     }
     None
@@ -1119,15 +1156,16 @@ fn mcp_tool_name(params: Option<&Value>) -> Option<(SharedString, SharedString)>
     let server: Option<String> = item
         .and_then(|i| i.get("server"))
         .and_then(Value::as_str)
-        .or_else(|| item.and_then(|i| i.get("serverLabel")).and_then(Value::as_str))
+        .or_else(|| {
+            item.and_then(|i| i.get("serverLabel"))
+                .and_then(Value::as_str)
+        })
         .or_else(|| params.get("server").and_then(Value::as_str))
         .or_else(|| params.get("serverLabel").and_then(Value::as_str))
         .map(str::to_string);
 
     match (server, tool) {
-        (Some(server), Some(tool)) => {
-            Some((SharedString::from(server), SharedString::from(tool)))
-        }
+        (Some(server), Some(tool)) => Some((SharedString::from(server), SharedString::from(tool))),
         (None, Some(tool)) => Some(("MCP".into(), SharedString::from(tool))),
         (Some(server), None) => Some((SharedString::from(server), "tool call".into())),
         (None, None) => None,
@@ -1183,14 +1221,26 @@ fn tool_title(
             .or_else(|| params.get("filePath").and_then(Value::as_str))
             .or_else(|| params.get("file").and_then(Value::as_str))
             .or_else(|| params.get("query").and_then(Value::as_str))
-            .or_else(|| item_payload.and_then(|item| item.get("path")).and_then(Value::as_str))
+            .or_else(|| {
+                item_payload
+                    .and_then(|item| item.get("path"))
+                    .and_then(Value::as_str)
+            })
             .or_else(|| {
                 item_payload
                     .and_then(|item| item.get("filePath"))
                     .and_then(Value::as_str)
             })
-            .or_else(|| item_payload.and_then(|item| item.get("file")).and_then(Value::as_str))
-            .or_else(|| item_payload.and_then(|item| item.get("query")).and_then(Value::as_str));
+            .or_else(|| {
+                item_payload
+                    .and_then(|item| item.get("file"))
+                    .and_then(Value::as_str)
+            })
+            .or_else(|| {
+                item_payload
+                    .and_then(|item| item.get("query"))
+                    .and_then(Value::as_str)
+            });
         if let Some(detail) = detail {
             return format!("{base}: {detail}").into();
         }

@@ -27,11 +27,11 @@ use std::{
     time::Duration,
 };
 use terminal_view::terminal_panel::Toggle as ToggleTerminalPanel;
-use url::Url;
 use ui::{
     ButtonLike, ButtonStyle, CircularProgress, CommonAnimationExt, ContextMenu, ContextMenuEntry,
     PopoverMenu, TintColor, Tooltip, WithScrollbar, prelude::*,
 };
+use url::Url;
 use workspace::{MultiWorkspace, MultiWorkspaceEvent, NewThread, ToggleWorkspaceMode};
 
 use crate::COMPOSER_KEY_CONTEXT;
@@ -51,8 +51,8 @@ use crate::serialization::{
     SerializedTranscriptMessage, SerializedTranscriptRole,
 };
 use crate::transcript::{
-    HarnessThread, HarnessThreadSummary, ToolDisplayKind, ToolStatus, TranscriptMessage,
-    TranscriptRole,
+    HarnessThread, HarnessThreadSummary, ResolvedFileMention, ToolDisplayKind, ToolStatus,
+    TranscriptMessage, TranscriptRole,
 };
 
 const COMPOSER_WIDTH: Pixels = px(720.0);
@@ -282,12 +282,6 @@ struct FileMentionSpan {
     path: String,
 }
 
-#[derive(Clone, Debug)]
-struct ResolvedFileMention {
-    source_range: Range<usize>,
-    abs_path: PathBuf,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct SkillMentionSpan {
     source_range: Range<usize>,
@@ -320,38 +314,49 @@ impl ComposerFileCompletionProvider {
         };
 
         let (skills, cwd, should_load) = surface.read(cx).available_skills_for_completion(cx);
-        if should_load && !skills.is_empty() {
-            surface.update(cx, |surface, cx| surface.refresh_available_skills(cx));
+        if !should_load {
+            return cx.spawn(async move |cx| filter_skill_definitions(skills, query, cx).await);
         }
 
-        if skills.is_empty() {
-            let Some(cwd) = cwd else {
-                return Task::ready(Vec::new());
-            };
-            let loaded_cwd = cwd.clone();
-            let surface = self.surface.clone();
-            return cx.spawn(async move |cx| {
-                let load_task =
-                    cx.background_spawn(async move { load_codex_available_skills(cwd).await });
-                let skills = load_task.await.unwrap_or_else(|error| {
-                    log::warn!("failed to load Codex skills: {error}");
-                    Vec::new()
-                });
-                cx.update(|cx| {
-                    if let Some(surface) = surface.upgrade() {
-                        surface.update(cx, |surface, _cx| {
-                            surface.skills_refresh_task = None;
-                            surface.available_skills_cwd = Some(loaded_cwd.clone());
-                            surface.available_skills = skills.clone();
-                        });
-                    }
-                });
-                filter_skill_definitions(skills, query, cx).await
-            });
-        }
+        let Some(cwd) = cwd else {
+            return Task::ready(Vec::new());
+        };
+        surface.update(cx, |surface, cx| surface.refresh_available_skills(cx));
+        let surface = self.surface.clone();
 
         cx.spawn(async move |cx| {
-            filter_skill_definitions(skills, query, cx).await
+            loop {
+                let Some(load_state) = cx
+                    .update(|cx| {
+                        let Some(surface) = surface.upgrade() else {
+                            return None;
+                        };
+
+                        Some(surface.read_with(cx, |surface, _| {
+                            if surface.available_skills_cwd.as_ref() != Some(&cwd) {
+                                return None;
+                            }
+
+                            if surface.skills_refresh_task.is_some() {
+                                return Some(None);
+                            }
+
+                            Some(Some(surface.available_skills.clone()))
+                        }))
+                    })
+                    .flatten()
+                else {
+                    return Vec::new();
+                };
+
+                if let Some(skills) = load_state {
+                    return filter_skill_definitions(skills, query, cx).await;
+                }
+
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+            }
         })
     }
 
@@ -485,7 +490,6 @@ impl ComposerFileCompletionProvider {
         editor: WeakEntity<Editor>,
         cx: &mut App,
     ) -> Completion {
-        let path_text = file_match.path_match.path.as_unix_str().to_string();
         let display_path = mention_display_path(workspace, &file_match.path_match, cx);
         let mention_label: SharedString = file_match
             .path_match
@@ -504,7 +508,7 @@ impl ComposerFileCompletionProvider {
             .project()
             .read(cx)
             .absolute_path(&project_path, cx);
-        let new_text = format!("{} ", format_file_mention(&path_text));
+        let new_text = format!("{} ", format_file_mention(&display_path));
         let content_len = new_text.len().saturating_sub(1);
         let mention_start = source_range.start;
 
@@ -600,8 +604,7 @@ impl CompletionProvider for ComposerFileCompletionProvider {
                     return Task::ready(Ok(Vec::new()));
                 };
                 let query = file_query.query.unwrap_or_default();
-                let search_task =
-                    self.search_files(query, Arc::new(AtomicBool::default()), cx);
+                let search_task = self.search_files(query, Arc::new(AtomicBool::default()), cx);
 
                 cx.spawn(async move |_, cx| {
                     let matches = search_task.await;
@@ -872,7 +875,10 @@ fn parse_file_mentions(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn parse_skill_mention_spans(text: &str, path_style: util::paths::PathStyle) -> Vec<SkillMentionSpan> {
+fn parse_skill_mention_spans(
+    text: &str,
+    path_style: util::paths::PathStyle,
+) -> Vec<SkillMentionSpan> {
     let mut mentions = Vec::new();
     let mut cursor = 0usize;
 
@@ -944,9 +950,11 @@ fn resolve_file_mention_spans(
     parse_file_mention_spans(text)
         .into_iter()
         .filter_map(|mention| {
-            resolve_agent_link(workspace, std::path::Path::new(&mention.path), cx).map(|abs_path| ResolvedFileMention {
-                source_range: mention.source_range,
-                abs_path,
+            resolve_agent_link(workspace, std::path::Path::new(&mention.path), cx).map(|abs_path| {
+                ResolvedFileMention {
+                    source_range: mention.source_range,
+                    abs_path,
+                }
             })
         })
         .collect()
@@ -1160,6 +1168,29 @@ fn resolve_agent_link(
 
     let project = workspace.read(cx).project().clone();
     let worktrees: Vec<_> = project.read(cx).worktrees(cx).collect();
+    let needle = path.to_string_lossy();
+    let needle = needle.trim_start_matches('/');
+    let needle_components: Vec<&str> = needle.split('/').filter(|s| !s.is_empty()).collect();
+
+    if let Some((root_name, relative_components)) = needle_components.split_first() {
+        for worktree in &worktrees {
+            let worktree_ref = worktree.read(cx);
+            if worktree_ref.root_name().as_unix_str() != *root_name {
+                continue;
+            }
+
+            let candidate = if relative_components.is_empty() {
+                worktree_ref.abs_path().to_path_buf()
+            } else {
+                worktree_ref
+                    .abs_path()
+                    .join(relative_components.iter().collect::<PathBuf>())
+            };
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
 
     for worktree in &worktrees {
         let candidate = worktree.read(cx).abs_path().join(path);
@@ -1168,9 +1199,6 @@ fn resolve_agent_link(
         }
     }
 
-    let needle = path.to_string_lossy();
-    let needle = needle.trim_start_matches('/');
-    let needle_components: Vec<&str> = needle.split('/').filter(|s| !s.is_empty()).collect();
     if needle_components.is_empty() {
         return None;
     }
@@ -1214,17 +1242,18 @@ fn open_agent_link(
 
     let parsed = util::paths::PathWithPosition::parse_str(url);
 
-    let abs_path = resolve_agent_link(&workspace, &parsed.path, cx).or_else(|| {
-        if !parsed.path.is_absolute() {
-            if let Some(cwd) = cwd {
-                let candidate = cwd.join(&parsed.path);
-                if candidate.exists() {
-                    return Some(candidate);
-                }
-            }
+    let abs_path = if parsed.path.is_absolute() {
+        resolve_agent_link(&workspace, &parsed.path, cx)
+    } else if let Some(cwd) = cwd {
+        let candidate = cwd.join(&parsed.path);
+        if candidate.exists() {
+            Some(candidate)
+        } else {
+            resolve_agent_link(&workspace, &parsed.path, cx)
         }
-        None
-    });
+    } else {
+        resolve_agent_link(&workspace, &parsed.path, cx)
+    };
 
     let Some(abs_path) = abs_path else {
         log::warn!("open_agent_link: could not resolve {url:?} to any file");
@@ -1253,9 +1282,7 @@ fn open_agent_link(
                     .update_in(cx, |editor, window, cx| {
                         let point = language::Point::new(row.saturating_sub(1), 0);
                         editor.change_selections(
-                            editor::SelectionEffects::scroll(
-                                editor::scroll::Autoscroll::center(),
-                            ),
+                            editor::SelectionEffects::scroll(editor::scroll::Autoscroll::center()),
                             window,
                             cx,
                             |selections| selections.select_ranges(vec![point..point]),
@@ -1437,7 +1464,6 @@ impl TranscriptView {
         cx.emit(TranscriptViewEvent::PreviewRequested(path));
     }
 
-
     fn pin_to_bottom(&mut self) {
         self.list_state.set_follow_mode(gpui::FollowMode::Tail);
         self.list_state.scroll_to_end();
@@ -1546,10 +1572,8 @@ impl TranscriptView {
         let skip_body = matches!(message.role, TranscriptRole::User)
             && message.text.is_empty()
             && !message.attachments.is_empty();
-        let file_mentions = if matches!(message.role, TranscriptRole::User)
-            && let Some(workspace) = self.workspace.upgrade()
-        {
-            resolve_file_mention_spans(&workspace, &message.text, cx)
+        let file_mentions = if matches!(message.role, TranscriptRole::User) {
+            message.file_mentions.clone()
         } else {
             Vec::new()
         };
@@ -1701,8 +1725,10 @@ impl TranscriptView {
                 .into_any_element()
         };
 
-        let is_file_tool =
-            matches!(kind, ToolDisplayKind::FileRead | ToolDisplayKind::FileChange);
+        let is_file_tool = matches!(
+            kind,
+            ToolDisplayKind::FileRead | ToolDisplayKind::FileChange
+        );
         let detail_element: Option<AnyElement> = match (is_reasoning, &summary) {
             (false, Some((_, Some(detail)))) if is_file_tool => {
                 let workspace = self.workspace.clone();
@@ -1805,25 +1831,23 @@ impl TranscriptView {
                 div()
                     .ml(px(20.0))
                     .text_color(Color::Muted.color(cx))
-                    .child(
-                        MarkdownElement::new(md_entity, style).on_url_click(
-                            move |url, window, cx| {
-                                if open_agent_link(
-                                    url.as_ref(),
-                                    &workspace_handle,
-                                    cwd.as_ref(),
-                                    window,
-                                    cx,
-                                ) {
-                                    if let Some(view) = this_weak.upgrade() {
-                                        view.update(cx, |_, cx| {
-                                            cx.emit(TranscriptViewEvent::OpenedInEditor);
-                                        });
-                                    }
+                    .child(MarkdownElement::new(md_entity, style).on_url_click(
+                        move |url, window, cx| {
+                            if open_agent_link(
+                                url.as_ref(),
+                                &workspace_handle,
+                                cwd.as_ref(),
+                                window,
+                                cx,
+                            ) {
+                                if let Some(view) = this_weak.upgrade() {
+                                    view.update(cx, |_, cx| {
+                                        cx.emit(TranscriptViewEvent::OpenedInEditor);
+                                    });
                                 }
-                            },
-                        ),
-                    )
+                            }
+                        },
+                    ))
                     .into_any_element()
             } else if has_body && kind.body_is_monospace() {
                 div()
@@ -2296,8 +2320,7 @@ impl AgentsSurface {
     }
 
     fn current_cwd(&self, cx: &App) -> Option<PathBuf> {
-        workspace_root_path(&self.workspace, cx)
-            .or_else(|| std::env::current_dir().ok())
+        workspace_root_path(&self.workspace, cx).or_else(|| std::env::current_dir().ok())
     }
 
     fn available_skills_for_completion(
@@ -2311,8 +2334,7 @@ impl AgentsSurface {
         } else {
             self.available_skills.clone()
         };
-        let should_load =
-            stale || (self.available_skills.is_empty() && self.skills_refresh_task.is_none());
+        let should_load = stale || self.available_skills.is_empty();
         (skills, cwd, should_load)
     }
 
@@ -2321,9 +2343,7 @@ impl AgentsSurface {
             return;
         };
 
-        if self.skills_refresh_task.is_some()
-            && self.available_skills_cwd.as_ref() == Some(&cwd)
-        {
+        if self.skills_refresh_task.is_some() && self.available_skills_cwd.as_ref() == Some(&cwd) {
             return;
         }
 
@@ -2678,6 +2698,8 @@ impl AgentsSurface {
         let path_style = self.workspace.read(cx).path_style(cx);
         let skill_mentions = self.resolve_skill_mentions(&text, cx);
         let sanitized_text = sanitize_skill_mentions(&text, path_style);
+        let combined_input = build_input_with_attachments(&sanitized_text, &attachments);
+        let file_mentions = resolve_file_mention_spans(&self.workspace, &sanitized_text, cx);
         let thread = self.thread_mut(&thread_id)?;
 
         if thread.messages.is_empty() {
@@ -2701,8 +2723,6 @@ impl AgentsSurface {
                 .into();
         }
 
-        let combined_input = build_input_with_attachments(&sanitized_text, &attachments);
-
         // Pre-turn estimate is only used until codex reports real usage via
         // turn/completed; once we have real numbers we stop accumulating
         // guesses.
@@ -2713,6 +2733,7 @@ impl AgentsSurface {
             role: TranscriptRole::User,
             text: sanitized_text,
             attachments,
+            file_mentions,
             started_at: None,
             duration_ms: None,
         });
@@ -2730,9 +2751,14 @@ impl AgentsSurface {
     }
 
     fn resolve_mentioned_attachments(&self, cx: &App) -> Vec<PathBuf> {
-        parse_file_mentions(&self.composer_editor.read(cx).text(cx))
+        let composer_text = self.composer_editor.read(cx).text(cx);
+        let composer_text =
+            sanitize_skill_mentions(&composer_text, self.workspace.read(cx).path_style(cx));
+        parse_file_mentions(&composer_text)
             .into_iter()
-            .filter_map(|mention| resolve_agent_link(&self.workspace, std::path::Path::new(&mention), cx))
+            .filter_map(|mention| {
+                resolve_agent_link(&self.workspace, std::path::Path::new(&mention), cx)
+            })
             .fold(Vec::new(), |mut attachments, path| {
                 if !attachments.iter().any(|existing| existing == &path) {
                     attachments.push(path);
@@ -2757,9 +2783,10 @@ impl AgentsSurface {
                 })
             })
             .fold(Vec::new(), |mut mentions, mention| {
-                if !mentions.iter().any(|existing| {
-                    existing.name == mention.name && existing.path == mention.path
-                }) {
+                if !mentions
+                    .iter()
+                    .any(|existing| existing.name == mention.name && existing.path == mention.path)
+                {
                     mentions.push(mention);
                 }
                 mentions
@@ -3075,8 +3102,8 @@ impl AgentsSurface {
                 let messages = serialized
                     .messages
                     .into_iter()
-                    .map(|message| TranscriptMessage {
-                        role: match message.role {
+                    .map(|message| {
+                        let role = match message.role {
                             SerializedTranscriptRole::User => TranscriptRole::User,
                             SerializedTranscriptRole::Assistant => TranscriptRole::Assistant,
                             SerializedTranscriptRole::System => TranscriptRole::System,
@@ -3101,11 +3128,22 @@ impl AgentsSurface {
                                     title: display_title,
                                 }
                             }
-                        },
-                        text: message.text,
-                        attachments: message.attachments,
-                        started_at: None,
-                        duration_ms: message.duration_ms,
+                        };
+                        let text = message.text;
+                        let file_mentions = if matches!(role, TranscriptRole::User) {
+                            resolve_file_mention_spans(&self.workspace, &text, cx)
+                        } else {
+                            Vec::new()
+                        };
+
+                        TranscriptMessage {
+                            role,
+                            text,
+                            attachments: message.attachments,
+                            file_mentions,
+                            started_at: None,
+                            duration_ms: message.duration_ms,
+                        }
                     })
                     .collect();
 
