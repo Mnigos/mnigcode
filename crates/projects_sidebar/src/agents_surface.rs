@@ -1,6 +1,7 @@
 use anyhow::Result;
 use editor::{
-    CompletionContext, CompletionProvider, ContextMenuOptions, Editor, FoldPlaceholder, ToOffset,
+    CompletionContext, CompletionProvider, ContextMenuOptions, Editor, FoldPlaceholder,
+    MultiBufferOffset, ToOffset,
     display_map::{Crease, CreaseId},
 };
 use fuzzy::PathMatch;
@@ -949,12 +950,39 @@ fn sanitize_skill_mentions(text: &str, path_style: util::paths::PathStyle) -> St
     sanitized
 }
 
+fn mask_skill_mentions(text: &str, path_style: util::paths::PathStyle) -> String {
+    let mentions = parse_skill_mention_spans(text, path_style);
+    if mentions.is_empty() {
+        return text.to_string();
+    }
+
+    let mut masked = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+
+    for mention in mentions {
+        if mention.source_range.start > cursor {
+            masked.push_str(&text[cursor..mention.source_range.start]);
+        }
+        masked.push_str(&" ".repeat(mention.source_range.end - mention.source_range.start));
+        cursor = mention.source_range.end;
+    }
+
+    if cursor < text.len() {
+        masked.push_str(&text[cursor..]);
+    }
+
+    masked
+}
+
 fn resolve_file_mention_spans(
     workspace: &Entity<workspace::Workspace>,
     text: &str,
     cx: &App,
 ) -> Vec<ResolvedFileMention> {
-    parse_file_mention_spans(text)
+    let path_style = workspace.read(cx).path_style(cx);
+    let masked_text = mask_skill_mentions(text, path_style);
+
+    parse_file_mention_spans(&masked_text)
         .into_iter()
         .filter_map(|mention| {
             resolve_agent_link(workspace, std::path::Path::new(&mention.path), cx).map(|abs_path| {
@@ -1382,6 +1410,7 @@ struct TranscriptView {
     active_thread: Option<Arc<HarnessThread>>,
     expanded_tool_messages: HashSet<(SharedString, usize)>,
     markdown_cache: HashMap<(SharedString, usize), (SharedString, Entity<Markdown>)>,
+    user_message_editor_cache: HashMap<(SharedString, usize), (String, Entity<Editor>)>,
     list_state: ListState,
 }
 
@@ -1394,6 +1423,7 @@ impl TranscriptView {
             active_thread: None,
             expanded_tool_messages: HashSet::default(),
             markdown_cache: HashMap::default(),
+            user_message_editor_cache: HashMap::default(),
             list_state,
         }
     }
@@ -1414,6 +1444,7 @@ impl TranscriptView {
         if previous_thread_id != next_thread_id {
             self.expanded_tool_messages.clear();
             self.markdown_cache.clear();
+            self.user_message_editor_cache.clear();
             self.list_state.reset(self.item_count());
             self.list_state.set_follow_mode(gpui::FollowMode::Tail);
             self.list_state.scroll_to_end();
@@ -1445,6 +1476,7 @@ impl TranscriptView {
     fn prune_markdown_cache(&mut self) {
         let Some(thread) = self.active_thread.as_ref() else {
             self.markdown_cache.clear();
+            self.user_message_editor_cache.clear();
             return;
         };
 
@@ -1452,6 +1484,10 @@ impl TranscriptView {
         self.markdown_cache.retain(|(cached_thread_id, index), _| {
             cached_thread_id == thread_id && *index < thread.messages.len()
         });
+        self.user_message_editor_cache
+            .retain(|(cached_thread_id, index), _| {
+                cached_thread_id == thread_id && *index < thread.messages.len()
+            });
     }
 
     fn toggle_tool_expansion(
@@ -1612,8 +1648,15 @@ impl TranscriptView {
                 TranscriptRole::System => Color::Warning,
                 _ => Color::Default,
             };
-            if matches!(message.role, TranscriptRole::User) && !file_mentions.is_empty() {
-                self.render_user_message_body(index, &message.text, &file_mentions, text_color, cx)
+            if matches!(message.role, TranscriptRole::User) {
+                self.render_user_message_body(
+                    thread_id.clone(),
+                    index,
+                    message,
+                    text_color,
+                    window,
+                    cx,
+                )
             } else {
                 div()
                     .text_color(text_color.color(cx))
@@ -2076,62 +2119,105 @@ impl TranscriptView {
     }
 
     fn render_user_message_body(
-        &self,
+        &mut self,
+        thread_id: SharedString,
         message_index: usize,
-        text: &str,
-        mentions: &[ResolvedFileMention],
-        text_color: Color,
+        message: &TranscriptMessage,
+        _text_color: Color,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let mut children = Vec::new();
-        let mut cursor = 0usize;
+        let cache_key = (thread_id, message_index);
+        let source = message.text.clone();
 
-        for (mention_index, mention) in mentions.iter().enumerate() {
-            if mention.source_range.start < cursor || mention.source_range.end > text.len() {
-                continue;
+        let editor = match self.user_message_editor_cache.get(&cache_key) {
+            Some((cached_source, editor)) if cached_source == &source => editor.clone(),
+            _ => {
+                let workspace = self.workspace.clone();
+                let file_mentions = message.file_mentions.clone();
+                let skill_mentions = self.workspace.upgrade().map_or_else(Vec::new, |workspace| {
+                    parse_skill_mention_spans(&source, workspace.read(cx).path_style(cx))
+                });
+
+                let editor = cx.new(|cx| {
+                    let mut editor = Editor::auto_height(1, 32, window, cx);
+                    editor.set_show_gutter(false, cx);
+                    editor.set_show_indent_guides(false, cx);
+                    editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
+                    editor.set_read_only(true);
+                    editor.set_text(source.clone(), window, cx);
+
+                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                    let mut creases = Vec::new();
+
+                    for mention in &skill_mentions {
+                        if mention.source_range.end > source.len() {
+                            continue;
+                        }
+
+                        let start =
+                            snapshot.anchor_after(MultiBufferOffset(mention.source_range.start));
+                        let end =
+                            snapshot.anchor_before(MultiBufferOffset(mention.source_range.end));
+                        creases.push(Crease::Inline {
+                            range: start..end,
+                            placeholder: FoldPlaceholder {
+                                render: render_skill_mention_pill(
+                                    mention.name.clone().into(),
+                                    mention.name.clone().into(),
+                                ),
+                                merge_adjacent: false,
+                                ..Default::default()
+                            },
+                            render_toggle: None,
+                            render_trailer: None,
+                            metadata: None,
+                        });
+                    }
+
+                    for mention in &file_mentions {
+                        if mention.source_range.end > source.len() {
+                            continue;
+                        }
+
+                        let start =
+                            snapshot.anchor_after(MultiBufferOffset(mention.source_range.start));
+                        let end =
+                            snapshot.anchor_before(MultiBufferOffset(mention.source_range.end));
+                        let label = attachment_display_name(&mention.abs_path);
+                        let tooltip: SharedString =
+                            mention.abs_path.to_string_lossy().to_string().into();
+                        creases.push(Crease::Inline {
+                            range: start..end,
+                            placeholder: FoldPlaceholder {
+                                render: render_file_mention_pill(
+                                    label,
+                                    tooltip,
+                                    mention.abs_path.clone(),
+                                    workspace.clone(),
+                                ),
+                                merge_adjacent: false,
+                                ..Default::default()
+                            },
+                            render_toggle: None,
+                            render_trailer: None,
+                            metadata: None,
+                        });
+                    }
+
+                    let crease_copies = creases.clone();
+                    editor.insert_creases(creases, cx);
+                    editor.fold_creases(crease_copies, false, window, cx);
+                    editor
+                });
+
+                self.user_message_editor_cache
+                    .insert(cache_key.clone(), (source.clone(), editor.clone()));
+                editor
             }
+        };
 
-            if cursor < mention.source_range.start {
-                children.push(
-                    div()
-                        .child(SharedString::from(
-                            text[cursor..mention.source_range.start].to_string(),
-                        ))
-                        .into_any_element(),
-                );
-            }
-
-            let label = attachment_display_name(&mention.abs_path);
-            let tooltip: SharedString = mention.abs_path.to_string_lossy().to_string().into();
-            children.push(file_mention_pill_element(
-                SharedString::from(format!(
-                    "message-file-mention-{message_index}-{mention_index}-{}",
-                    mention.abs_path.display()
-                )),
-                label,
-                tooltip,
-                mention.abs_path.clone(),
-                self.workspace.clone(),
-            ));
-            cursor = mention.source_range.end;
-        }
-
-        if cursor < text.len() {
-            children.push(
-                div()
-                    .child(SharedString::from(text[cursor..].to_string()))
-                    .into_any_element(),
-            );
-        }
-
-        h_flex()
-            .text_color(text_color.color(cx))
-            .text_sm()
-            .whitespace_normal()
-            .items_center()
-            .flex_wrap()
-            .children(children)
-            .into_any_element()
+        div().child(editor).into_any_element()
     }
 }
 
@@ -2710,7 +2796,7 @@ impl AgentsSurface {
         let skill_mentions = self.resolve_skill_mentions(&text, cx);
         let sanitized_text = sanitize_skill_mentions(&text, path_style);
         let combined_input = build_input_with_attachments(&sanitized_text, &attachments);
-        let file_mentions = resolve_file_mention_spans(&self.workspace, &sanitized_text, cx);
+        let file_mentions = resolve_file_mention_spans(&self.workspace, &text, cx);
         let thread = self.thread_mut(&thread_id)?;
 
         if thread.messages.is_empty() {
@@ -2742,7 +2828,7 @@ impl AgentsSurface {
         }
         thread.messages.push(TranscriptMessage {
             role: TranscriptRole::User,
-            text: sanitized_text,
+            text,
             attachments,
             file_mentions,
             started_at: None,
@@ -3890,7 +3976,7 @@ mod tests {
 
     use super::{
         ComposerQuery, FileMentionQuery, FileMentionSpan, SkillMentionQuery, SkillMentionSpan,
-        format_file_mention, parse_file_mention_spans, parse_file_mentions,
+        format_file_mention, mask_skill_mentions, parse_file_mention_spans, parse_file_mentions,
         parse_skill_mention_spans, sanitize_skill_mentions,
     };
 
@@ -4012,5 +4098,15 @@ mod tests {
             ),
             "Use $Linear Workflow next"
         );
+    }
+
+    #[test]
+    fn masks_skill_mentions_before_file_parsing() {
+        let masked = mask_skill_mentions(
+            "Use [@Linear Workflow](zed:///agent/skill/Linear%20Workflow) with @src/main.rs",
+            PathStyle::local(),
+        );
+
+        assert_eq!(parse_file_mentions(&masked), vec!["src/main.rs"]);
     }
 }
