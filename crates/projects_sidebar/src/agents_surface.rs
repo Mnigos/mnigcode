@@ -320,34 +320,25 @@ impl ComposerFileCompletionProvider {
             return Task::ready(Vec::new());
         };
         let project = surface.read(cx).workspace.read(cx).project().clone();
-        let servers = project.read(cx).context_server_store().read(cx).running_servers();
+        let store = project.read(cx).context_server_store();
+        let skills: Vec<SkillDefinition> = store
+            .read(cx)
+            .configured_server_ids()
+            .into_iter()
+            .map(|server_id| SkillDefinition {
+                name: server_id.0.to_string().into(),
+                description: "MCP server".into(),
+            })
+            .collect();
+
+        if skills.is_empty() {
+            return Task::ready(Vec::new());
+        }
+        if query.is_empty() {
+            return Task::ready(skills);
+        }
 
         cx.spawn(async move |cx| {
-            let mut skills = Vec::new();
-            for server in servers {
-                let Some(client) = server.client() else {
-                    continue;
-                };
-                if let Ok(response) = client
-                    .request::<context_server::types::requests::ListTools>(())
-                    .await
-                {
-                    for tool in response.tools {
-                        let description = tool
-                            .description
-                            .unwrap_or_default();
-                        skills.push(SkillDefinition {
-                            name: SharedString::from(tool.name),
-                            description: SharedString::from(description),
-                        });
-                    }
-                }
-            }
-
-            if query.is_empty() {
-                return skills;
-            }
-
             let candidates: Vec<_> = skills
                 .iter()
                 .enumerate()
