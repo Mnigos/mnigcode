@@ -2150,8 +2150,29 @@ impl AgentsSurface {
                 composer_subscription,
             ],
         };
+        this.refresh_skills(cx);
         this.sync_transcript_view(cx);
         this
+    }
+
+    fn refresh_skills(&mut self, cx: &App) {
+        let project = self.workspace.read(cx).project().clone();
+        let store = project.read(cx).context_server_store();
+        let store = store.read(cx);
+        self.skills = store
+            .configured_server_ids()
+            .into_iter()
+            .map(|server_id| {
+                let status = store
+                    .status_for_server(&server_id)
+                    .map(|s| format!("{s:?}"))
+                    .unwrap_or_else(|| "configured".to_string());
+                SkillDefinition {
+                    name: server_id.0.to_string().into(),
+                    description: format!("MCP server ({status})").into(),
+                }
+            })
+            .collect();
     }
 
     /// Coalesce rapid streaming updates into at most one re-render per
