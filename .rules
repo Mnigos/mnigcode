@@ -1,3 +1,22 @@
+# mnigcode — Codex-flavored Zed fork
+
+This repository is a **fork of [Zed](https://github.com/zed-industries/zed)** (the open-source code editor). It diverges from upstream to build a Codex-style AI coding experience on top of Zed's editor, GPUI framework, and workspace infrastructure.
+
+## What makes this fork unique
+
+- **Custom agents surface** (`crates/projects_sidebar/`) — a standalone chat UI that talks to an OpenAI Codex app-server via a JSON-RPC harness (`harness.rs`), completely separate from Zed's native `agent_ui` panel.
+- **Codex harness** — spawns a Codex subprocess, streams turns/tool-events, and renders them in a transcript view with tool call cards, Markdown, and file diffs.
+- **Skill mentions** — users type `$` or `/` in the composer to attach skills (capabilities / MCP integrations) to a message, rendered as inline chips. Skill data lives in `AgentsSurface.skills`.
+- **File mentions** — `@` in the composer triggers fuzzy file search and inserts crease-based mention chips, similar to upstream but wired to the Codex composer, not the ACP-based message editor.
+- **Projects sidebar** — replaces or augments the default sidebar with per-workspace thread management, thread groups, serialization, and a model/reasoning-effort/sandbox-policy selector.
+
+## When working in this repo
+
+- Changes to `crates/projects_sidebar/` are fork-specific. Upstream Zed does not have this crate.
+- Changes to `crates/agent_ui/`, `crates/agent/`, `crates/acp_thread/` touch upstream code. Be aware that upstream merges may conflict.
+- The Codex composer (`AgentsSurface`) uses its own `ComposerFileCompletionProvider`, not the `PromptCompletionProvider` from `agent_ui`. Features added to one do not automatically appear in the other.
+- The harness communicates with the Codex app-server over stdin/stdout JSON-RPC — not via ACP session updates. `available_commands` from the ACP pipeline do not reach the Codex composer.
+
 # Rust coding guidelines
 
 * Prioritize code correctness and clarity. Speed and efficiency are secondary priorities unless otherwise specified.
