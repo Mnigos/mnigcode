@@ -242,7 +242,7 @@ impl SkillMentionQuery {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 enum ComposerQuery {
     File(FileMentionQuery),
     Skill(SkillMentionQuery),
@@ -250,22 +250,25 @@ enum ComposerQuery {
 
 impl ComposerQuery {
     fn try_parse(line: &str, offset_to_line: usize) -> Option<Self> {
-        if line.contains('$') {
-            if let Some(skill) = SkillMentionQuery::try_parse(line, offset_to_line, '$') {
-                return Some(Self::Skill(skill));
-            }
-        }
-        if line.contains('/') {
-            if let Some(skill) = SkillMentionQuery::try_parse(line, offset_to_line, '/') {
-                return Some(Self::Skill(skill));
-            }
-        }
-        if line.contains('@') {
-            if let Some(file) = FileMentionQuery::try_parse(line, offset_to_line) {
-                return Some(Self::File(file));
-            }
-        }
-        None
+        let candidates = [
+            line.contains('$')
+                .then(|| SkillMentionQuery::try_parse(line, offset_to_line, '$'))
+                .flatten()
+                .map(Self::Skill),
+            line.contains('/')
+                .then(|| SkillMentionQuery::try_parse(line, offset_to_line, '/'))
+                .flatten()
+                .map(Self::Skill),
+            line.contains('@')
+                .then(|| FileMentionQuery::try_parse(line, offset_to_line))
+                .flatten()
+                .map(Self::File),
+        ];
+
+        candidates
+            .into_iter()
+            .flatten()
+            .max_by_key(|query| (query.source_range().end, query.source_range().start))
     }
 
     fn source_range(&self) -> &Range<usize> {
@@ -2168,6 +2171,7 @@ pub struct AgentsSurface {
     selected_reasoning_effort: String,
     selected_sandbox_policy: HarnessSandboxPolicy,
     available_skills: Vec<SkillDefinition>,
+    available_skills_loaded: bool,
     available_skills_cwd: Option<PathBuf>,
     skills_refresh_task: Option<Task<()>>,
     codex_sessions: HashMap<HarnessThreadId, CodexSessionHandle>,
@@ -2276,6 +2280,7 @@ impl AgentsSurface {
             selected_reasoning_effort: DEFAULT_REASONING_EFFORT.to_string(),
             selected_sandbox_policy: HarnessSandboxPolicy::DangerFullAccess,
             available_skills: Vec::new(),
+            available_skills_loaded: false,
             available_skills_cwd: None,
             skills_refresh_task: None,
             codex_sessions: HashMap::new(),
@@ -2334,7 +2339,8 @@ impl AgentsSurface {
         } else {
             self.available_skills.clone()
         };
-        let should_load = stale || self.available_skills.is_empty();
+        let should_load =
+            stale || (!self.available_skills_loaded && self.skills_refresh_task.is_none());
         (skills, cwd, should_load)
     }
 
@@ -2348,6 +2354,7 @@ impl AgentsSurface {
         }
 
         self.available_skills_cwd = Some(cwd.clone());
+        self.available_skills_loaded = false;
         let loaded_cwd = cwd.clone();
         self.skills_refresh_task = Some(cx.spawn(async move |this, cx| {
             let load_task =
@@ -2358,6 +2365,7 @@ impl AgentsSurface {
                 match result {
                     Ok(skills) if this.available_skills_cwd.as_ref() == Some(&loaded_cwd) => {
                         this.available_skills = skills;
+                        this.available_skills_loaded = true;
                     }
                     Ok(_) => {}
                     Err(error) => {
@@ -3878,9 +3886,9 @@ mod tests {
     use util::paths::PathStyle;
 
     use super::{
-        FileMentionQuery, FileMentionSpan, SkillMentionSpan, format_file_mention,
-        parse_file_mention_spans, parse_file_mentions, parse_skill_mention_spans,
-        sanitize_skill_mentions,
+        ComposerQuery, FileMentionQuery, FileMentionSpan, SkillMentionQuery, SkillMentionSpan,
+        format_file_mention, parse_file_mention_spans, parse_file_mentions,
+        parse_skill_mention_spans, sanitize_skill_mentions,
     };
 
     #[test]
@@ -3949,6 +3957,24 @@ mod tests {
                 source_range: 8..24,
                 query: Some("src/my file.rs".to_string()),
             })
+        );
+    }
+
+    #[test]
+    fn prefers_active_trigger_over_earlier_mentions() {
+        assert_eq!(
+            ComposerQuery::try_parse("@src/main.rs $linear", 0),
+            Some(ComposerQuery::Skill(SkillMentionQuery {
+                source_range: 13..20,
+                query: Some("linear".to_string()),
+            }))
+        );
+        assert_eq!(
+            ComposerQuery::try_parse("/linear @src/main.rs", 0),
+            Some(ComposerQuery::File(FileMentionQuery {
+                source_range: 8..20,
+                query: Some("src/main.rs".to_string()),
+            }))
         );
     }
 

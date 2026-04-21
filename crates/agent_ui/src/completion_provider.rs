@@ -1730,19 +1730,24 @@ impl PromptCompletion {
         offset_to_line: usize,
         supported_modes: &[PromptContextType],
     ) -> Option<Self> {
-        if line.contains('@') {
-            if let Some(mention) =
-                MentionCompletion::try_parse(line, offset_to_line, supported_modes)
-            {
-                return Some(Self::Mention(mention));
-            }
-        }
-        if line.contains('$') {
-            if let Some(skill) = SkillCompletion::try_parse(line, offset_to_line) {
-                return Some(Self::Skill(skill));
-            }
-        }
-        SlashCommandCompletion::try_parse(line, offset_to_line).map(Self::SlashCommand)
+        let candidates = [
+            line.contains('@')
+                .then(|| MentionCompletion::try_parse(line, offset_to_line, supported_modes))
+                .flatten()
+                .map(Self::Mention),
+            line.contains('$')
+                .then(|| SkillCompletion::try_parse(line, offset_to_line))
+                .flatten()
+                .map(Self::Skill),
+            SlashCommandCompletion::try_parse(line, offset_to_line).map(Self::SlashCommand),
+        ];
+
+        candidates.into_iter().flatten().max_by_key(|completion| {
+            (
+                completion.source_range().end,
+                completion.source_range().start,
+            )
+        })
     }
 }
 
@@ -2786,6 +2791,14 @@ mod tests {
             PromptCompletion::try_parse("Hello $linear", 0, &supported_modes),
             Some(PromptCompletion::Skill(SkillCompletion {
                 source_range: 6..13,
+                query: Some("linear".to_string()),
+            }))
+        );
+
+        assert_eq!(
+            PromptCompletion::try_parse("@file main.rs $linear", 0, &supported_modes),
+            Some(PromptCompletion::Skill(SkillCompletion {
+                source_range: 14..21,
                 query: Some("linear".to_string()),
             }))
         );
