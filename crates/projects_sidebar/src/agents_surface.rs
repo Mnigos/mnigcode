@@ -2155,24 +2155,40 @@ impl AgentsSurface {
         this
     }
 
-    fn refresh_skills(&mut self, cx: &App) {
+    fn refresh_skills(&mut self, cx: &mut Context<Self>) {
         let project = self.workspace.read(cx).project().clone();
         let store = project.read(cx).context_server_store();
-        let store = store.read(cx);
-        self.skills = store
-            .configured_server_ids()
-            .into_iter()
-            .map(|server_id| {
-                let status = store
-                    .status_for_server(&server_id)
-                    .map(|s| format!("{s:?}"))
-                    .unwrap_or_else(|| "configured".to_string());
-                SkillDefinition {
-                    name: server_id.0.to_string().into(),
-                    description: format!("MCP server ({status})").into(),
+        let servers = store.read(cx).running_servers();
+
+        cx.spawn(async move |this, cx| {
+            let mut skills = Vec::new();
+            for server in servers {
+                let Some(client) = server.client() else {
+                    continue;
+                };
+                let server_id = server.id();
+                if let Ok(response) = client
+                    .request::<context_server::types::requests::ListTools>(())
+                    .await
+                {
+                    for tool in response.tools {
+                        let description = tool
+                            .description
+                            .unwrap_or_else(|| format!("{} tool", server_id.0));
+                        skills.push(SkillDefinition {
+                            name: SharedString::from(tool.name),
+                            description: SharedString::from(description),
+                        });
+                    }
                 }
+            }
+            this.update(cx, |this, cx| {
+                this.skills = skills;
+                cx.notify();
             })
-            .collect();
+            .ok();
+        })
+        .detach();
     }
 
     /// Coalesce rapid streaming updates into at most one re-render per
