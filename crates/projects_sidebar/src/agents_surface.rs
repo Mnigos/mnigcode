@@ -2343,8 +2343,7 @@ impl AgentsSurface {
         } else {
             self.available_skills.clone()
         };
-        let should_load =
-            stale || (!self.available_skills_loaded && self.skills_refresh_task.is_none());
+        let should_load = stale || !self.available_skills_loaded;
         (skills, cwd, should_load)
     }
 
