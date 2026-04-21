@@ -844,10 +844,10 @@ fn parse_tool_event(method: &str, params: Option<&Value>) -> Option<ParsedToolEv
     // `first` can be either a phase (modern: `item/added`) or a legacy kind
     // (`item/commandExecution/start`). Fall back to item.type when the URL
     // doesn't name the kind directly.
-    let (kind_str, phase_str): (&str, &str) = if let Some(item_type) = item_type {
+    let (kind_str, phase_str): (&str, &str) = if !second.is_empty() {
+        (item_type.unwrap_or(first), second)
+    } else if let Some(item_type) = item_type {
         (item_type, first)
-    } else if !second.is_empty() {
-        (first, second)
     } else {
         // No kind source at all — best effort, use the URL segment as the kind
         // with an unspecified phase.
@@ -864,11 +864,7 @@ fn parse_tool_event(method: &str, params: Option<&Value>) -> Option<ParsedToolEv
         other => HarnessToolKind::Other(other.to_string().into()),
     };
 
-    let phase = match phase_str {
-        "added" | "start" | "started" | "began" => HarnessToolPhase::Start,
-        "completed" | "end" | "ended" | "complete" | "finished" => HarnessToolPhase::End,
-        _ => HarnessToolPhase::Update,
-    };
+    let phase = resolve_tool_phase(phase_str, params);
 
     let item_id = extract_item_id(params);
     let detail = extract_tool_detail(&kind, phase_str, params);
@@ -897,6 +893,45 @@ fn extract_item_id(params: Option<&Value>) -> Option<String> {
         })
         .or_else(|| params.get("id").and_then(Value::as_str))
         .map(str::to_string)
+}
+
+fn resolve_tool_phase(phase_str: &str, params: Option<&Value>) -> HarnessToolPhase {
+    match phase_str {
+        "added" | "start" | "started" | "began" => return HarnessToolPhase::Start,
+        "completed" | "end" | "ended" | "complete" | "finished" => {
+            return HarnessToolPhase::End;
+        }
+        _ => {}
+    }
+
+    match extract_item_status(params) {
+        Some(
+            "completed"
+            | "complete"
+            | "finished"
+            | "done"
+            | "succeeded"
+            | "success"
+            | "failed"
+            | "error"
+            | "errored"
+            | "cancelled"
+            | "canceled"
+            | "interrupted",
+        ) => HarnessToolPhase::End,
+        Some("added" | "pending" | "queued" | "started" | "starting") => HarnessToolPhase::Start,
+        _ => HarnessToolPhase::Update,
+    }
+}
+
+fn extract_item_status(params: Option<&Value>) -> Option<&str> {
+    let params = params?;
+
+    params
+        .get("item")
+        .and_then(|item| item.get("status"))
+        .and_then(Value::as_str)
+        .or_else(|| params.get("status").and_then(Value::as_str))
 }
 
 fn extract_tool_detail(
@@ -973,7 +1008,10 @@ fn extract_tool_detail(
     }
 
     if matches!(kind, HarnessToolKind::McpToolCall) {
-        return SharedString::default();
+        return extract_mcp_tool_arguments(params, item_payload)
+            .and_then(|arguments| format_mcp_tool_arguments(arguments))
+            .unwrap_or_default()
+            .into();
     }
 
     // Generic file/search/other extraction.
@@ -1175,6 +1213,116 @@ fn reasoning_text(params: &Value, item_payload: Option<&Value>) -> Option<String
     }
 }
 
+fn extract_mcp_tool_arguments<'a>(
+    params: &'a Value,
+    item_payload: Option<&'a Value>,
+) -> Option<&'a Value> {
+    let argument_keys = [
+        "arguments",
+        "args",
+        "input",
+        "params",
+        "parameters",
+        "toolInput",
+        "tool_input",
+    ];
+
+    item_payload
+        .and_then(|item| {
+            argument_keys
+                .iter()
+                .find_map(|key| item.get(*key))
+        })
+        .or_else(|| {
+            argument_keys
+                .iter()
+                .find_map(|key| params.get(*key))
+        })
+}
+
+fn format_mcp_tool_arguments(arguments: &Value) -> Option<String> {
+    match arguments {
+        Value::Null => None,
+        Value::String(arguments) => {
+            let arguments = arguments.trim();
+            if arguments.is_empty() {
+                return None;
+            }
+
+            if let Ok(parsed_arguments) = serde_json::from_str::<Value>(arguments)
+                && let Some(formatted_arguments) = format_mcp_tool_arguments(&parsed_arguments)
+            {
+                return Some(formatted_arguments);
+            }
+
+            Some(format!("Input: {arguments}"))
+        }
+        Value::Object(arguments) => {
+            let mut fields = Vec::new();
+            for (key, value) in arguments {
+                collect_mcp_argument_fields(key, value, &mut fields);
+            }
+
+            if fields.is_empty() {
+                None
+            } else {
+                Some(fields.join("\n"))
+            }
+        }
+        Value::Array(arguments) if arguments.is_empty() => None,
+        Value::Array(arguments) => Some(
+            arguments
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    format!("{}: {}", index + 1, format_mcp_argument_value(value))
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
+        _ => Some(format!("Input: {}", format_mcp_argument_value(arguments))),
+    }
+}
+
+fn collect_mcp_argument_fields(prefix: &str, value: &Value, fields: &mut Vec<String>) {
+    match value {
+        Value::Null => {}
+        Value::Object(object) if object.is_empty() => {}
+        Value::Object(object) => {
+            for (key, value) in object {
+                let nested_prefix = format!("{prefix}.{key}");
+                collect_mcp_argument_fields(&nested_prefix, value, fields);
+            }
+        }
+        _ => fields.push(format!("{prefix}: {}", format_mcp_argument_value(value))),
+    }
+}
+
+fn format_mcp_argument_value(value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        Value::Array(values)
+            if values.iter().all(|value| {
+                matches!(
+                    value,
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+                )
+            }) => {
+            values
+                .iter()
+                .map(format_mcp_argument_value)
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+        Value::Array(_) | Value::Object(_) => {
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+        }
+    }
+}
+
 fn mcp_tool_name(params: Option<&Value>) -> Option<(SharedString, SharedString)> {
     let params = params?;
     let item = params.get("item");
@@ -1282,6 +1430,103 @@ fn tool_title(
     }
 
     base
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{HarnessToolKind, parse_tool_event};
+
+    #[test]
+    fn formats_mcp_tool_arguments_as_fields() {
+        let params = json!({
+            "item": {
+                "id": "call-1",
+                "type": "mcpToolCall",
+                "server": "linear-ludus",
+                "tool": "get_issue",
+                "arguments": {
+                    "id": "RIG-435",
+                    "includeRelations": true
+                }
+            }
+        });
+
+        let event = parse_tool_event("item/added", Some(&params)).unwrap();
+
+        assert_eq!(event.kind, HarnessToolKind::McpToolCall);
+        assert_eq!(event.title.as_ref(), "linear-ludus: get_issue");
+        assert!(event.detail.lines().any(|line| line == "id: RIG-435"));
+        assert!(
+            event
+                .detail
+                .lines()
+                .any(|line| line == "includeRelations: true")
+        );
+    }
+
+    #[test]
+    fn formats_stringified_mcp_tool_arguments_as_fields() {
+        let params = json!({
+            "item": {
+                "id": "call-1",
+                "type": "mcpToolCall",
+                "server": "linear-ludus",
+                "tool": "list_issue_comments",
+                "arguments": "{\"issueId\":\"RIG-435\",\"limit\":50}"
+            }
+        });
+
+        let event = parse_tool_event("item/completed", Some(&params)).unwrap();
+
+        assert_eq!(event.kind, HarnessToolKind::McpToolCall);
+        assert!(event.detail.lines().any(|line| line == "issueId: RIG-435"));
+        assert!(event.detail.lines().any(|line| line == "limit: 50"));
+    }
+
+    #[test]
+    fn treats_updated_completed_tool_items_as_terminal() {
+        let params = json!({
+            "item": {
+                "id": "cmd-1",
+                "type": "commandExecution",
+                "status": "completed",
+                "command": ["/bin/zsh", "-lc", "pwd"],
+                "output": "/tmp/workspace"
+            }
+        });
+
+        let event = parse_tool_event("item/updated", Some(&params)).unwrap();
+
+        assert_eq!(event.kind, HarnessToolKind::Command);
+        assert_eq!(event.phase, super::HarnessToolPhase::End);
+        assert_eq!(event.title.as_ref(), "Run command: /bin/zsh -lc pwd");
+        assert_eq!(event.detail.as_ref(), "/tmp/workspace");
+    }
+
+    #[test]
+    fn treats_legacy_command_completed_events_as_terminal() {
+        let params = json!({
+            "item": {
+                "id": "cmd-2",
+                "type": "commandExecution",
+                "status": "completed",
+                "command": ["/bin/zsh", "-lc", "sed -n '1,20p' file.txt"],
+                "aggregatedOutput": "hello"
+            }
+        });
+
+        let event = parse_tool_event("item/commandExecution/completed", Some(&params)).unwrap();
+
+        assert_eq!(event.kind, HarnessToolKind::Command);
+        assert_eq!(event.phase, super::HarnessToolPhase::End);
+        assert_eq!(
+            event.title.as_ref(),
+            "Run command: /bin/zsh -lc sed -n '1,20p' file.txt"
+        );
+        assert_eq!(event.detail.as_ref(), "hello");
+    }
 }
 
 fn append_codex_skills(skills: &mut Vec<HarnessSkillDefinition>, result: &Value) {
