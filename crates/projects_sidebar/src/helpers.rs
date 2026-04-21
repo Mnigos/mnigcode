@@ -92,6 +92,7 @@ pub(crate) fn tool_summary_line(
         ToolDisplayKind::FileChange => "Edit file".into(),
         ToolDisplayKind::WebSearch => "Web search".into(),
         ToolDisplayKind::Reasoning => "Thought".into(),
+        ToolDisplayKind::McpToolCall => "MCP tool call".into(),
         ToolDisplayKind::Other => title.clone(),
     };
 

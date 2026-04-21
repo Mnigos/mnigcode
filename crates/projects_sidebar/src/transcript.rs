@@ -74,6 +74,7 @@ pub(crate) enum ToolDisplayKind {
     FileChange,
     WebSearch,
     Reasoning,
+    McpToolCall,
     Other,
 }
 
@@ -85,6 +86,7 @@ impl ToolDisplayKind {
             HarnessToolKind::FileChange => Self::FileChange,
             HarnessToolKind::WebSearch => Self::WebSearch,
             HarnessToolKind::Reasoning => Self::Reasoning,
+            HarnessToolKind::McpToolCall => Self::McpToolCall,
             HarnessToolKind::Other(_) => Self::Other,
         }
     }
@@ -96,6 +98,7 @@ impl ToolDisplayKind {
             ToolDisplayKind::FileChange => IconName::Pencil,
             ToolDisplayKind::WebSearch => IconName::MagnifyingGlass,
             ToolDisplayKind::Reasoning => IconName::ToolThink,
+            ToolDisplayKind::McpToolCall => IconName::ToolHammer,
             ToolDisplayKind::Other => IconName::ToolHammer,
         }
     }
