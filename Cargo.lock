@@ -13494,6 +13494,7 @@ dependencies = [
 name = "projects_sidebar"
 version = "0.1.0"
 dependencies = [
+ "acp_thread",
  "anyhow",
  "editor",
  "futures 0.3.32",
