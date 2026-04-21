@@ -179,14 +179,18 @@ impl FileMentionQuery {
         }
 
         let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-        let token = rest[..token_end]
-            .trim_end_matches(|character: char| ",;:!?)]}".contains(character))
-            .to_string();
+        let token = &rest[..token_end];
+        let trimmed_token =
+            token.trim_end_matches(|character: char| ",;:!?)]}".contains(character));
 
         Some(Self {
             source_range: mention_start + offset_to_line
-                ..mention_start + token_end + 1 + offset_to_line,
-            query: if token.is_empty() { None } else { Some(token) },
+                ..mention_start + trimmed_token.len() + 1 + offset_to_line,
+            query: if trimmed_token.is_empty() {
+                None
+            } else {
+                Some(trimmed_token.to_string())
+            },
         })
     }
 }
@@ -3956,6 +3960,13 @@ mod tests {
             Some(FileMentionQuery {
                 source_range: 8..24,
                 query: Some("src/my file.rs".to_string()),
+            })
+        );
+        assert_eq!(
+            FileMentionQuery::try_parse("Look at @src/main.rs,", 0),
+            Some(FileMentionQuery {
+                source_range: 8..20,
+                query: Some("src/main.rs".to_string()),
             })
         );
     }
