@@ -795,8 +795,8 @@ impl NativeAgent {
         cx: &mut Context<Self>,
     ) {
         match event {
-            ContextServerRegistryEvent::ToolsChanged => {}
-            ContextServerRegistryEvent::PromptsChanged => {
+            ContextServerRegistryEvent::ToolsChanged
+            | ContextServerRegistryEvent::PromptsChanged => {
                 let project_id = self.projects.iter().find_map(|(id, state)| {
                     if state.context_server_registry == registry {
                         Some(*id)
@@ -847,7 +847,7 @@ impl NativeAgent {
                 .or_insert(0) += 1;
         }
 
-        registry
+        let mut commands: Vec<acp::AvailableCommand> = registry
             .prompts()
             .flat_map(|context_server_prompt| {
                 let prompt = &context_server_prompt.prompt;
@@ -879,14 +879,44 @@ impl NativeAgent {
                     }
                     Some([]) | None => {}
                     Some(_) => {
-                        // skip >1 argument commands since we don't support them yet
                         return None;
                     }
                 }
 
                 Some(command)
             })
-            .collect()
+            .collect();
+
+        let mut tool_name_counts: HashMap<SharedString, usize> = HashMap::default();
+        for (_, tools) in registry.servers() {
+            for (name, _) in tools {
+                *tool_name_counts.entry(name.clone()).or_insert(0) += 1;
+            }
+        }
+
+        for (server_id, tools) in registry.servers() {
+            for (_, tool) in tools {
+                let name = tool.name();
+                let should_prefix = tool_name_counts
+                    .get(&name)
+                    .copied()
+                    .unwrap_or(0)
+                    > 1;
+
+                let display_name = if should_prefix {
+                    format!("{}.{}", server_id, name).into()
+                } else {
+                    name
+                };
+
+                commands.push(acp::AvailableCommand::new(
+                    display_name.to_string(),
+                    tool.description().to_string(),
+                ));
+            }
+        }
+
+        commands
     }
 
     pub fn load_thread(

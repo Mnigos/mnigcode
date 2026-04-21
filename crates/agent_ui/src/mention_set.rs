@@ -154,6 +154,7 @@ impl MentionSet {
             MentionUri::Selection { abs_path: None, .. } => Task::ready(Err(anyhow!(
                 "Untitled buffer selection mentions are not supported for paste"
             ))),
+            MentionUri::Skill { .. } => Task::ready(Ok(Mention::Link)),
             MentionUri::PastedImage { .. }
             | MentionUri::TerminalSelection { .. }
             | MentionUri::MergeConflict { .. } => {
@@ -304,6 +305,7 @@ impl MentionSet {
                 debug_panic!("unexpected merge conflict URI");
                 Task::ready(Err(anyhow!("unexpected merge conflict URI")))
             }
+            MentionUri::Skill { .. } => Task::ready(Ok(Mention::Link)),
         };
         let task = cx
             .spawn(async move |_, _| task.await.map_err(|e| e.to_string()))
