@@ -359,7 +359,11 @@ impl ComposerFileCompletionProvider {
         editor: WeakEntity<Editor>,
         _cx: &mut App,
     ) -> Completion {
-        let mention_text = format!("[${}](zed:///agent/skill/{})", skill.name, skill.name);
+        let uri = acp_thread::MentionUri::Skill {
+            name: skill.name.to_string(),
+            description: skill.description.to_string(),
+        };
+        let mention_text = uri.as_link();
         let new_text = format!("{} ", mention_text);
         let content_len = new_text.len().saturating_sub(1);
         let mention_start = source_range.start;
@@ -2138,20 +2142,7 @@ impl AgentsSurface {
             selected_reasoning_effort: DEFAULT_REASONING_EFFORT.to_string(),
             selected_sandbox_policy: HarnessSandboxPolicy::DangerFullAccess,
             codex_sessions: HashMap::new(),
-            skills: vec![
-                SkillDefinition {
-                    name: "Linear Workflow".into(),
-                    description: "Linear MCP integration for fetching issues, projects, and managing tasks".into(),
-                },
-                SkillDefinition {
-                    name: "GitHub".into(),
-                    description: "GitHub integration for PRs, issues, and repositories".into(),
-                },
-                SkillDefinition {
-                    name: "Web Search".into(),
-                    description: "Search the web for information".into(),
-                },
-            ],
+            skills: Vec::new(),
             streaming_notify_task: None,
             _subscriptions: vec![
                 active_workspace_subscription,
