@@ -14,6 +14,7 @@ path = "src/projects_sidebar.rs"
 [dependencies]
 acp_thread.workspace = true
 anyhow.workspace = true
+context_server.workspace = true
 editor.workspace = true
 fuzzy.workspace = true
 futures.workspace = true
