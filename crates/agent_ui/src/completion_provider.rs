@@ -215,6 +215,9 @@ pub trait PromptCompletionProviderDelegate: Send + Sync + 'static {
     fn supports_images(&self, cx: &App) -> bool;
 
     fn available_commands(&self, cx: &App) -> Vec<AvailableCommand>;
+    fn available_skills(&self, cx: &App) -> Vec<AvailableCommand> {
+        self.available_commands(cx)
+    }
     fn confirm_command(&self, cx: &mut App);
 }
 
@@ -830,6 +833,82 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
                 workspace,
             )),
         }
+    }
+
+    fn completion_for_skill(
+        command: AvailableCommand,
+        source_range: Range<Anchor>,
+        source: Arc<T>,
+        editor: WeakEntity<Editor>,
+        mention_set: WeakEntity<MentionSet>,
+        workspace: Entity<Workspace>,
+        cx: &mut App,
+    ) -> Completion {
+        let uri = MentionUri::Skill {
+            name: command.name.to_string(),
+            description: command.description.to_string(),
+        };
+        let new_text = format!("{} ", uri.as_link());
+        let new_text_len = new_text.len();
+        let icon_path = uri.icon_path(cx);
+        Completion {
+            replace_range: source_range.clone(),
+            new_text,
+            label: CodeLabel::plain(command.name.to_string(), None),
+            documentation: Some(CompletionDocumentation::MultiLinePlainText(
+                command.description.into(),
+            )),
+            source: project::CompletionSource::Custom,
+            icon_path: Some(icon_path),
+            match_start: None,
+            snippet_deduplication_key: None,
+            insert_text_mode: None,
+            confirm: Some(confirm_completion_callback(
+                command.name.into(),
+                source_range.start,
+                new_text_len - 1,
+                uri,
+                source,
+                editor,
+                mention_set,
+                workspace,
+            )),
+        }
+    }
+
+    fn search_skills(&self, query: String, cx: &mut App) -> Task<Vec<AvailableCommand>> {
+        let commands = self.source.available_skills(cx);
+        if commands.is_empty() {
+            return Task::ready(Vec::new());
+        }
+
+        if query.is_empty() {
+            return Task::ready(commands);
+        }
+
+        cx.spawn(async move |cx| {
+            let candidates = commands
+                .iter()
+                .enumerate()
+                .map(|(id, command)| StringMatchCandidate::new(id, &command.name))
+                .collect::<Vec<_>>();
+
+            let matches = fuzzy::match_strings(
+                &candidates,
+                &query,
+                false,
+                true,
+                100,
+                &Arc::new(AtomicBool::default()),
+                cx.background_executor().clone(),
+            )
+            .await;
+
+            matches
+                .into_iter()
+                .map(|mat| commands[mat.candidate_id].clone())
+                .collect()
+        })
     }
 
     fn search_slash_commands(&self, query: String, cx: &mut App) -> Task<Vec<AvailableCommand>> {
@@ -1508,6 +1587,36 @@ impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletio
                     }])
                 })
             }
+            PromptCompletion::Skill(SkillCompletion { query, .. }) => {
+                let search_task = self.search_skills(query.unwrap_or_default(), cx);
+                cx.spawn(async move |_, cx| {
+                    let commands = search_task.await;
+                    let completions = cx.update(|cx| {
+                        commands
+                            .into_iter()
+                            .map(|command| {
+                                Self::completion_for_skill(
+                                    command,
+                                    source_range.clone(),
+                                    source.clone(),
+                                    editor.clone(),
+                                    mention_set.clone(),
+                                    workspace.clone(),
+                                    cx,
+                                )
+                            })
+                            .collect()
+                    });
+
+                    Ok(vec![CompletionResponse {
+                        completions,
+                        display_options: CompletionDisplayOptions {
+                            dynamic_width: true,
+                        },
+                        is_incomplete: true,
+                    }])
+                })
+            }
         }
     }
 
@@ -1604,6 +1713,7 @@ fn confirm_completion_callback<T: PromptCompletionProviderDelegate>(
 enum PromptCompletion {
     SlashCommand(SlashCommandCompletion),
     Mention(MentionCompletion),
+    Skill(SkillCompletion),
 }
 
 impl PromptCompletion {
@@ -1611,6 +1721,7 @@ impl PromptCompletion {
         match self {
             Self::SlashCommand(completion) => completion.source_range.clone(),
             Self::Mention(completion) => completion.source_range.clone(),
+            Self::Skill(completion) => completion.source_range.clone(),
         }
     }
 
@@ -1624,6 +1735,11 @@ impl PromptCompletion {
                 MentionCompletion::try_parse(line, offset_to_line, supported_modes)
             {
                 return Some(Self::Mention(mention));
+            }
+        }
+        if line.contains('$') {
+            if let Some(skill) = SkillCompletion::try_parse(line, offset_to_line) {
+                return Some(Self::Skill(skill));
             }
         }
         SlashCommandCompletion::try_parse(line, offset_to_line).map(Self::SlashCommand)
@@ -1759,6 +1875,55 @@ impl MentionCompletion {
             source_range: last_mention_start + offset_to_line..end + offset_to_line,
             mode,
             argument,
+        })
+    }
+}
+
+#[derive(Debug, Default, PartialEq)]
+struct SkillCompletion {
+    source_range: Range<usize>,
+    query: Option<String>,
+}
+
+impl SkillCompletion {
+    fn try_parse(line: &str, offset_to_line: usize) -> Option<Self> {
+        let mut last_skill_start = None;
+        for (idx, _) in line.rmatch_indices('$') {
+            if line[idx + 1..]
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_whitespace())
+            {
+                continue;
+            }
+
+            if idx > 0
+                && line[..idx]
+                    .chars()
+                    .last()
+                    .is_some_and(|c| !c.is_whitespace())
+            {
+                continue;
+            }
+
+            last_skill_start = Some(idx);
+            break;
+        }
+
+        let last_skill_start = last_skill_start?;
+        let rest_of_line = &line[last_skill_start + 1..];
+
+        let mut query = None;
+        let mut end = last_skill_start + 1;
+
+        if let Some(query_text) = rest_of_line.split_whitespace().next() {
+            end += query_text.len();
+            query = Some(query_text.to_string());
+        }
+
+        Some(Self {
+            source_range: last_skill_start + offset_to_line..end + offset_to_line,
+            query,
         })
     }
 }
@@ -2275,6 +2440,14 @@ mod tests {
                 argument: None,
             }))
         );
+
+        assert_eq!(
+            PromptCompletion::try_parse("$skill", 0, &supported_modes),
+            Some(PromptCompletion::Skill(SkillCompletion {
+                source_range: 0..6,
+                query: Some("skill".to_string()),
+            }))
+        );
     }
 
     #[test]
@@ -2541,6 +2714,80 @@ mod tests {
                 argument: Some("https://example.com/@".to_string()),
             }),
             "Should parse URL ending with @ (even if URL is incomplete)"
+        );
+    }
+
+    #[test]
+    fn test_skill_completion_parse() {
+        assert_eq!(
+            SkillCompletion::try_parse("$", 0),
+            Some(SkillCompletion {
+                source_range: 0..1,
+                query: None,
+            })
+        );
+
+        assert_eq!(
+            SkillCompletion::try_parse("$linear", 0),
+            Some(SkillCompletion {
+                source_range: 0..7,
+                query: Some("linear".to_string()),
+            })
+        );
+
+        assert_eq!(
+            SkillCompletion::try_parse("Lorem $linear", 0),
+            Some(SkillCompletion {
+                source_range: 6..13,
+                query: Some("linear".to_string()),
+            })
+        );
+
+        assert_eq!(
+            SkillCompletion::try_parse("Lorem $ linear", 0),
+            None,
+            "Should not parse with a space after $"
+        );
+
+        assert_eq!(
+            SkillCompletion::try_parse("test$", 0),
+            None,
+            "Should not parse $ inside a word"
+        );
+
+        assert_eq!(
+            SkillCompletion::try_parse("Lorem Ipsum", 0),
+            None,
+            "Should not parse without $"
+        );
+    }
+
+    #[test]
+    fn test_prompt_completion_parse_skill() {
+        let supported_modes = vec![PromptContextType::File, PromptContextType::Symbol];
+
+        assert_eq!(
+            PromptCompletion::try_parse("$", 0, &supported_modes),
+            Some(PromptCompletion::Skill(SkillCompletion {
+                source_range: 0..1,
+                query: None,
+            }))
+        );
+
+        assert_eq!(
+            PromptCompletion::try_parse("$linear", 0, &supported_modes),
+            Some(PromptCompletion::Skill(SkillCompletion {
+                source_range: 0..7,
+                query: Some("linear".to_string()),
+            }))
+        );
+
+        assert_eq!(
+            PromptCompletion::try_parse("Hello $linear", 0, &supported_modes),
+            Some(PromptCompletion::Skill(SkillCompletion {
+                source_range: 6..13,
+                query: Some("linear".to_string()),
+            }))
         );
     }
 

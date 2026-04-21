@@ -111,6 +111,7 @@ struct MessageEditorCompletionDelegate {
     session_capabilities: SharedSessionCapabilities,
     has_thread_store: bool,
     message_editor: WeakEntity<MessageEditor>,
+    workspace: WeakEntity<Workspace>,
 }
 
 impl PromptCompletionProviderDelegate for MessageEditorCompletionDelegate {
@@ -126,6 +127,35 @@ impl PromptCompletionProviderDelegate for MessageEditorCompletionDelegate {
 
     fn available_commands(&self, _cx: &App) -> Vec<crate::completion_provider::AvailableCommand> {
         self.session_capabilities.read().completion_commands()
+    }
+
+    fn available_skills(&self, cx: &App) -> Vec<crate::completion_provider::AvailableCommand> {
+        let mut skills = self.session_capabilities.read().completion_commands();
+
+        if let Some(workspace) = self.workspace.upgrade() {
+            let project = workspace.read(cx).project().clone();
+            let store = project.read(cx).context_server_store();
+            let store = store.read(cx);
+            for server_id in store.configured_server_ids() {
+                let already_listed = skills.iter().any(|s| {
+                    s.name.as_ref() == server_id.0.as_ref()
+                        || s.name.starts_with(&format!("{}.", server_id.0))
+                });
+                if !already_listed {
+                    let status = store
+                        .status_for_server(&server_id)
+                        .map(|s| format!("{:?}", s))
+                        .unwrap_or_else(|| "configured".to_string());
+                    skills.push(crate::completion_provider::AvailableCommand {
+                        name: server_id.0.to_string().into(),
+                        description: format!("MCP server ({})", status).into(),
+                        requires_argument: false,
+                    });
+                }
+            }
+        }
+
+        skills
     }
 
     fn confirm_command(&self, cx: &mut App) {
@@ -455,6 +485,7 @@ impl MessageEditor {
                 session_capabilities: session_capabilities.clone(),
                 has_thread_store: thread_store.is_some(),
                 message_editor: cx.weak_entity(),
+                workspace: workspace.clone(),
             },
             editor.downgrade(),
             mention_set.clone(),

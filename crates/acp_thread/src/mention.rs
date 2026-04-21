@@ -61,6 +61,10 @@ pub enum MentionUri {
     MergeConflict {
         file_path: String,
     },
+    Skill {
+        name: String,
+        description: String,
+    },
 }
 
 impl MentionUri {
@@ -215,6 +219,16 @@ impl MentionUri {
                 } else if path.starts_with("/agent/merge-conflict") {
                     let file_path = single_query_param(&url, "path")?.unwrap_or_default();
                     Ok(Self::MergeConflict { file_path })
+                } else if let Some(name) = path.strip_prefix("/agent/skill/") {
+                    let name = decode(name)
+                        .unwrap_or(Cow::Borrowed(name))
+                        .into_owned();
+                    let description = url
+                        .query_pairs()
+                        .find(|(k, _)| k == "description")
+                        .map(|(_, v)| v.into_owned())
+                        .unwrap_or_default();
+                    Ok(Self::Skill { name, description })
                 } else {
                     bail!("invalid zed url: {:?}", input);
                 }
@@ -256,6 +270,7 @@ impl MentionUri {
                 line_range,
                 ..
             } => selection_name(path.as_deref(), line_range),
+            MentionUri::Skill { name, .. } => name.clone(),
             MentionUri::Fetch { url } => url.to_string(),
         }
     }
@@ -291,6 +306,9 @@ impl MentionUri {
                 )
                 .into(),
             ),
+            MentionUri::Skill { description, .. } => {
+                Some(description.clone().into()).filter(|d: &SharedString| !d.is_empty())
+            }
             _ => None,
         }
     }
@@ -312,6 +330,7 @@ impl MentionUri {
             MentionUri::Fetch { .. } => IconName::ToolWeb.path().into(),
             MentionUri::GitDiff { .. } => IconName::GitBranch.path().into(),
             MentionUri::MergeConflict { .. } => IconName::GitMergeConflict.path().into(),
+            MentionUri::Skill { .. } => IconName::Box.path().into(),
         }
     }
 
@@ -417,6 +436,15 @@ impl MentionUri {
             MentionUri::MergeConflict { file_path } => {
                 let mut url = Url::parse("zed:///agent/merge-conflict").unwrap();
                 url.query_pairs_mut().append_pair("path", file_path);
+                url
+            }
+            MentionUri::Skill { name, description } => {
+                let mut url = Url::parse("zed:///").unwrap();
+                url.set_path(&format!("/agent/skill/{name}"));
+                if !description.is_empty() {
+                    url.query_pairs_mut()
+                        .append_pair("description", description);
+                }
                 url
             }
         }
@@ -756,5 +784,36 @@ mod tests {
         let single_line_uri = "zed:///agent/terminal-selection?lines=1";
         let parsed_single = MentionUri::parse(single_line_uri, PathStyle::local()).unwrap();
         assert_eq!(parsed_single.name(), "Terminal (1 line)");
+    }
+
+    #[test]
+    fn test_parse_skill_uri() {
+        let skill_uri = "zed:///agent/skill/Linear%20Workflow?description=Linear+MCP+integration";
+        let parsed = MentionUri::parse(skill_uri, PathStyle::local()).unwrap();
+        match &parsed {
+            MentionUri::Skill { name, description } => {
+                assert_eq!(name, "Linear Workflow");
+                assert_eq!(description, "Linear MCP integration");
+            }
+            _ => panic!("Expected Skill variant"),
+        }
+        assert_eq!(parsed.name(), "Linear Workflow");
+    }
+
+    #[test]
+    fn test_skill_uri_round_trip() {
+        let uri = MentionUri::Skill {
+            name: "Linear Workflow".to_string(),
+            description: "Linear MCP integration".to_string(),
+        };
+        let serialized = uri.to_uri().to_string();
+        let parsed = MentionUri::parse(&serialized, PathStyle::local()).unwrap();
+        match &parsed {
+            MentionUri::Skill { name, description } => {
+                assert_eq!(name, "Linear Workflow");
+                assert_eq!(description, "Linear MCP integration");
+            }
+            _ => panic!("Expected Skill variant"),
+        }
     }
 }
