@@ -398,13 +398,29 @@ impl ProjectsSidebar {
             return;
         }
 
-        for paths in project_path_groups.into_iter().rev() {
-            multi_workspace.update(cx, |multi_workspace, cx| {
-                multi_workspace
-                    .open_project(paths.clone(), OpenMode::Activate, window, cx)
-                    .detach_and_log_err(cx);
-            });
-        }
+        let multi_workspace = multi_workspace.downgrade();
+        cx.spawn_in(window, async move |_this, cx| {
+            for paths in project_path_groups {
+                let Some(multi_workspace) = multi_workspace.upgrade() else {
+                    return;
+                };
+
+                let open_task = match multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+                    multi_workspace.open_project(paths, OpenMode::Activate, window, cx)
+                }) {
+                    Ok(task) => task,
+                    Err(error) => {
+                        log::warn!("failed to schedule project restoration: {error}");
+                        return;
+                    }
+                };
+
+                if let Err(error) = open_task.await {
+                    log::warn!("failed to restore project group: {error}");
+                }
+            }
+        })
+        .detach();
     }
 
     fn render_project_row(
