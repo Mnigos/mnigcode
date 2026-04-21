@@ -161,6 +161,7 @@ pub enum HarnessToolPhase {
     Start,
     Update,
     End,
+    Failed,
 }
 
 pub async fn run_codex_app_server_session(
@@ -905,20 +906,12 @@ fn resolve_tool_phase(phase_str: &str, params: Option<&Value>) -> HarnessToolPha
     }
 
     match extract_item_status(params) {
-        Some(
-            "completed"
-            | "complete"
-            | "finished"
-            | "done"
-            | "succeeded"
-            | "success"
-            | "failed"
-            | "error"
-            | "errored"
-            | "cancelled"
-            | "canceled"
-            | "interrupted",
-        ) => HarnessToolPhase::End,
+        Some("completed" | "complete" | "finished" | "done" | "succeeded" | "success") => {
+            HarnessToolPhase::End
+        }
+        Some("failed" | "error" | "errored" | "cancelled" | "canceled" | "interrupted") => {
+            HarnessToolPhase::Failed
+        }
         Some("added" | "pending" | "queued" | "started" | "starting") => HarnessToolPhase::Start,
         _ => HarnessToolPhase::Update,
     }
@@ -1526,6 +1519,26 @@ mod tests {
             "Run command: /bin/zsh -lc sed -n '1,20p' file.txt"
         );
         assert_eq!(event.detail.as_ref(), "hello");
+    }
+
+    #[test]
+    fn treats_failed_tool_items_as_failed_terminal_phase() {
+        let params = json!({
+            "item": {
+                "id": "cmd-3",
+                "type": "commandExecution",
+                "status": "failed",
+                "command": ["/bin/zsh", "-lc", "exit 1"],
+                "output": "failed"
+            }
+        });
+
+        let event = parse_tool_event("item/updated", Some(&params)).unwrap();
+
+        assert_eq!(event.kind, HarnessToolKind::Command);
+        assert_eq!(event.phase, super::HarnessToolPhase::Failed);
+        assert_eq!(event.title.as_ref(), "Run command: /bin/zsh -lc exit 1");
+        assert_eq!(event.detail.as_ref(), "failed");
     }
 }
 

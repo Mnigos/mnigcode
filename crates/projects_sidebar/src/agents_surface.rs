@@ -1359,6 +1359,7 @@ fn tool_status_after_phase(status: ToolStatus, phase: HarnessToolPhase) -> ToolS
     match (status, phase) {
         (ToolStatus::Failed, _) => ToolStatus::Failed,
         (ToolStatus::Completed, _) => ToolStatus::Completed,
+        (_, HarnessToolPhase::Failed) => ToolStatus::Failed,
         (_, HarnessToolPhase::End) => ToolStatus::Completed,
         _ => ToolStatus::Running,
     }
@@ -3103,10 +3104,7 @@ impl AgentsSurface {
                             }
                         }
                     } else {
-                        let status = match phase {
-                            HarnessToolPhase::End => ToolStatus::Completed,
-                            _ => ToolStatus::Running,
-                        };
+                        let status = tool_status_after_phase(ToolStatus::Running, phase);
                         let mut new_message = TranscriptMessage::new(
                             TranscriptRole::Tool {
                                 item_id: item_id.clone(),
@@ -4085,6 +4083,14 @@ mod tests {
         assert_eq!(
             tool_status_after_phase(ToolStatus::Failed, HarnessToolPhase::End),
             ToolStatus::Failed
+        );
+        assert_eq!(
+            tool_status_after_phase(ToolStatus::Running, HarnessToolPhase::Failed),
+            ToolStatus::Failed
+        );
+        assert_eq!(
+            tool_status_after_phase(ToolStatus::Completed, HarnessToolPhase::Failed),
+            ToolStatus::Completed
         );
     }
 
