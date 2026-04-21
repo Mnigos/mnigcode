@@ -5,16 +5,16 @@ use editor::{
 };
 use fuzzy::PathMatch;
 use gpui::{
-    AnyElement, App, Context, Entity, EventEmitter, ExternalPaths, Focusable, ListAlignment,
-    ListSizingBehavior, ListState, MouseButton, ObjectFit, PathPromptOptions, Pixels, Render,
-    SharedString, Subscription, Task, WeakEntity, Window, deferred, img, list, px,
+    AnyElement, App, AsyncApp, Context, Entity, EventEmitter, ExternalPaths, Focusable,
+    ListAlignment, ListSizingBehavior, ListState, MouseButton, ObjectFit, PathPromptOptions,
+    Pixels, Render, SharedString, Subscription, Task, WeakEntity, Window, deferred, img, list, px,
 };
 use language::{ToPoint, language_settings::SoftWrap};
 use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use menu::Confirm;
 use project::{
     Candidates, Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource,
-    PathMatchCandidateSet,
+    PathMatchCandidateSet, lsp_store::CompletionDocumentation,
 };
 use smol::channel;
 use std::{
@@ -27,6 +27,7 @@ use std::{
     time::Duration,
 };
 use terminal_view::terminal_panel::Toggle as ToggleTerminalPanel;
+use url::Url;
 use ui::{
     ButtonLike, ButtonStyle, CircularProgress, CommonAnimationExt, ContextMenu, ContextMenuEntry,
     PopoverMenu, TintColor, Tooltip, WithScrollbar, prelude::*,
@@ -36,8 +37,9 @@ use workspace::{MultiWorkspace, MultiWorkspaceEvent, NewThread, ToggleWorkspaceM
 use crate::COMPOSER_KEY_CONTEXT;
 use crate::harness::{
     HarnessApprovalPolicy, HarnessKind, HarnessRunStatus, HarnessSandboxPolicy,
-    HarnessSessionConfig, HarnessThreadId, HarnessToolPhase, HarnessTurnInput, HarnessTurnUpdate,
-    run_codex_app_server_session,
+    HarnessSessionConfig, HarnessSkillDefinition as SkillDefinition, HarnessSkillMention,
+    HarnessThreadId, HarnessToolPhase, HarnessTurnInput, HarnessTurnUpdate,
+    load_codex_available_skills, run_codex_app_server_session,
 };
 use crate::helpers::{
     animated_thinking_label, attachment_display_name, attachment_icon,
@@ -195,12 +197,6 @@ struct FileMentionMatch {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SkillDefinition {
-    pub name: SharedString,
-    pub description: SharedString,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 struct SkillMentionQuery {
     source_range: Range<usize>,
     query: Option<String>,
@@ -292,6 +288,13 @@ struct ResolvedFileMention {
     abs_path: PathBuf,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SkillMentionSpan {
+    source_range: Range<usize>,
+    name: String,
+    path: Option<PathBuf>,
+}
+
 struct ComposerFileCompletionProvider {
     multi_workspace: WeakEntity<MultiWorkspace>,
     surface: WeakEntity<AgentsSurface>,
@@ -311,55 +314,44 @@ impl ComposerFileCompletionProvider {
         }
     }
 
-    fn search_skills(
-        &self,
-        query: String,
-        cx: &mut App,
-    ) -> Task<Vec<SkillDefinition>> {
+    fn search_skills(&self, query: String, cx: &mut App) -> Task<Vec<SkillDefinition>> {
         let Some(surface) = self.surface.upgrade() else {
             return Task::ready(Vec::new());
         };
-        let project = surface.read(cx).workspace.read(cx).project().clone();
-        let store = project.read(cx).context_server_store();
-        let skills: Vec<SkillDefinition> = store
-            .read(cx)
-            .configured_server_ids()
-            .into_iter()
-            .map(|server_id| SkillDefinition {
-                name: server_id.0.to_string().into(),
-                description: "MCP server".into(),
-            })
-            .collect();
+
+        let (skills, cwd, should_load) = surface.read(cx).available_skills_for_completion(cx);
+        if should_load && !skills.is_empty() {
+            surface.update(cx, |surface, cx| surface.refresh_available_skills(cx));
+        }
 
         if skills.is_empty() {
-            return Task::ready(Vec::new());
-        }
-        if query.is_empty() {
-            return Task::ready(skills);
+            let Some(cwd) = cwd else {
+                return Task::ready(Vec::new());
+            };
+            let loaded_cwd = cwd.clone();
+            let surface = self.surface.clone();
+            return cx.spawn(async move |cx| {
+                let load_task =
+                    cx.background_spawn(async move { load_codex_available_skills(cwd).await });
+                let skills = load_task.await.unwrap_or_else(|error| {
+                    log::warn!("failed to load Codex skills: {error}");
+                    Vec::new()
+                });
+                cx.update(|cx| {
+                    if let Some(surface) = surface.upgrade() {
+                        surface.update(cx, |surface, _cx| {
+                            surface.skills_refresh_task = None;
+                            surface.available_skills_cwd = Some(loaded_cwd.clone());
+                            surface.available_skills = skills.clone();
+                        });
+                    }
+                });
+                filter_skill_definitions(skills, query, cx).await
+            });
         }
 
         cx.spawn(async move |cx| {
-            let candidates: Vec<_> = skills
-                .iter()
-                .enumerate()
-                .map(|(id, skill)| fuzzy::StringMatchCandidate::new(id, &skill.name))
-                .collect();
-
-            let matches = fuzzy::match_strings(
-                &candidates,
-                &query,
-                false,
-                true,
-                100,
-                &Arc::new(AtomicBool::default()),
-                cx.background_executor().clone(),
-            )
-            .await;
-
-            matches
-                .into_iter()
-                .map(|mat| skills[mat.candidate_id].clone())
-                .collect()
+            filter_skill_definitions(skills, query, cx).await
         })
     }
 
@@ -374,7 +366,13 @@ impl ComposerFileCompletionProvider {
             name: skill.name.to_string(),
             description: skill.description.to_string(),
         };
-        let mention_text = uri.as_link();
+        let mut mention_uri = uri.to_uri();
+        if let Some(path) = &skill.path {
+            mention_uri
+                .query_pairs_mut()
+                .append_pair("path", &path.to_string_lossy());
+        }
+        let mention_text = format!("[@{}]({})", uri.name(), mention_uri);
         let new_text = format!("{} ", mention_text);
         let content_len = new_text.len().saturating_sub(1);
         let mention_start = source_range.start;
@@ -385,7 +383,7 @@ impl ComposerFileCompletionProvider {
             replace_range: source_range,
             new_text,
             label: language::CodeLabel::plain(skill.name.to_string(), None),
-            documentation: None,
+            documentation: Some(CompletionDocumentation::MultiLinePlainText(tooltip.clone())),
             source: CompletionSource::Custom,
             icon_path: Some(IconName::Box.path().into()),
             match_start: None,
@@ -714,6 +712,36 @@ fn format_token_count(tokens: usize) -> String {
     }
 }
 
+async fn filter_skill_definitions(
+    skills: Vec<SkillDefinition>,
+    query: String,
+    cx: &mut AsyncApp,
+) -> Vec<SkillDefinition> {
+    if query.is_empty() {
+        return skills;
+    }
+
+    let candidates: Vec<_> = skills
+        .iter()
+        .enumerate()
+        .map(|(id, skill)| fuzzy::StringMatchCandidate::new(id, &skill.name))
+        .collect();
+
+    fuzzy::match_strings(
+        &candidates,
+        &query,
+        false,
+        true,
+        100,
+        &Arc::new(AtomicBool::default()),
+        cx.background_executor().clone(),
+    )
+    .await
+    .into_iter()
+    .map(|mat| skills[mat.candidate_id].clone())
+    .collect()
+}
+
 fn is_mention_boundary(previous_character: Option<char>) -> bool {
     previous_character.is_none_or(|character| {
         character.is_whitespace() || matches!(character, '(' | '[' | '{' | '<' | '\'' | '"')
@@ -842,6 +870,70 @@ fn parse_file_mentions(text: &str) -> Vec<String> {
         .into_iter()
         .map(|mention| mention.path)
         .collect()
+}
+
+fn parse_skill_mention_spans(text: &str, path_style: util::paths::PathStyle) -> Vec<SkillMentionSpan> {
+    let mut mentions = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(relative_start) = text[cursor..].find("[@") {
+        let mention_start = cursor + relative_start;
+        let Some(relative_link_separator) = text[mention_start + 2..].find("](") else {
+            break;
+        };
+        let url_start = mention_start + 2 + relative_link_separator + 2;
+        let Some(relative_url_end) = text[url_start..].find(')') else {
+            break;
+        };
+        let url_end = url_start + relative_url_end;
+        let url = &text[url_start..url_end];
+        cursor = url_end + 1;
+
+        let Ok(acp_thread::MentionUri::Skill { name, .. }) =
+            acp_thread::MentionUri::parse(url, path_style)
+        else {
+            continue;
+        };
+
+        let path = Url::parse(url).ok().and_then(|url| {
+            url.query_pairs()
+                .find(|(key, _)| key == "path")
+                .map(|(_, value)| PathBuf::from(value.into_owned()))
+        });
+
+        mentions.push(SkillMentionSpan {
+            source_range: mention_start..url_end + 1,
+            name,
+            path,
+        });
+    }
+
+    mentions
+}
+
+fn sanitize_skill_mentions(text: &str, path_style: util::paths::PathStyle) -> String {
+    let mentions = parse_skill_mention_spans(text, path_style);
+    if mentions.is_empty() {
+        return text.to_string();
+    }
+
+    let mut sanitized = String::new();
+    let mut cursor = 0usize;
+
+    for mention in mentions {
+        if mention.source_range.start > cursor {
+            sanitized.push_str(&text[cursor..mention.source_range.start]);
+        }
+        sanitized.push('$');
+        sanitized.push_str(&mention.name);
+        cursor = mention.source_range.end;
+    }
+
+    if cursor < text.len() {
+        sanitized.push_str(&text[cursor..]);
+    }
+
+    sanitized
 }
 
 fn resolve_file_mention_spans(
@@ -2051,6 +2143,9 @@ pub struct AgentsSurface {
     selected_model: String,
     selected_reasoning_effort: String,
     selected_sandbox_policy: HarnessSandboxPolicy,
+    available_skills: Vec<SkillDefinition>,
+    available_skills_cwd: Option<PathBuf>,
+    skills_refresh_task: Option<Task<()>>,
     codex_sessions: HashMap<HarnessThreadId, CodexSessionHandle>,
     streaming_notify_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
@@ -2071,7 +2166,11 @@ impl AgentsSurface {
         let composer_editor = cx.new(|cx| {
             let mut editor = Editor::auto_height(1, 8, window, cx);
             editor.set_soft_wrap_mode(SoftWrap::EditorWidth, cx);
-            editor.set_placeholder_text("Ask anything, @ to add files, $ for skills", window, cx);
+            editor.set_placeholder_text(
+                "Ask anything, @ to add files, $ or / for skills",
+                window,
+                cx,
+            );
             editor.set_show_indent_guides(false, cx);
             editor.set_cursor_blink(false, cx);
             editor.set_show_completions_on_input(Some(true));
@@ -2098,6 +2197,7 @@ impl AgentsSurface {
                 if matches!(event, MultiWorkspaceEvent::ActiveWorkspaceChanged) {
                     this.workspace = multi_workspace.read(cx).workspace().clone();
                     this.sync_transcript_view(cx);
+                    this.refresh_available_skills(cx);
                     cx.notify();
                 }
             },
@@ -2151,6 +2251,9 @@ impl AgentsSurface {
             selected_model: DEFAULT_MODEL.to_string(),
             selected_reasoning_effort: DEFAULT_REASONING_EFFORT.to_string(),
             selected_sandbox_policy: HarnessSandboxPolicy::DangerFullAccess,
+            available_skills: Vec::new(),
+            available_skills_cwd: None,
+            skills_refresh_task: None,
             codex_sessions: HashMap::new(),
             streaming_notify_task: None,
             _subscriptions: vec![
@@ -2160,6 +2263,7 @@ impl AgentsSurface {
             ],
         };
         this.sync_transcript_view(cx);
+        this.refresh_available_skills(cx);
         this
     }
 
@@ -2189,6 +2293,61 @@ impl AgentsSurface {
         self.transcript_view.update(cx, |transcript_view, cx| {
             transcript_view.sync_state(workspace, thread, cx);
         });
+    }
+
+    fn current_cwd(&self, cx: &App) -> Option<PathBuf> {
+        workspace_root_path(&self.workspace, cx)
+            .or_else(|| std::env::current_dir().ok())
+    }
+
+    fn available_skills_for_completion(
+        &self,
+        cx: &App,
+    ) -> (Vec<SkillDefinition>, Option<PathBuf>, bool) {
+        let cwd = self.current_cwd(cx);
+        let stale = cwd.as_ref() != self.available_skills_cwd.as_ref();
+        let skills = if stale {
+            Vec::new()
+        } else {
+            self.available_skills.clone()
+        };
+        let should_load =
+            stale || (self.available_skills.is_empty() && self.skills_refresh_task.is_none());
+        (skills, cwd, should_load)
+    }
+
+    fn refresh_available_skills(&mut self, cx: &mut Context<Self>) {
+        let Some(cwd) = self.current_cwd(cx) else {
+            return;
+        };
+
+        if self.skills_refresh_task.is_some()
+            && self.available_skills_cwd.as_ref() == Some(&cwd)
+        {
+            return;
+        }
+
+        self.available_skills_cwd = Some(cwd.clone());
+        let loaded_cwd = cwd.clone();
+        self.skills_refresh_task = Some(cx.spawn(async move |this, cx| {
+            let load_task =
+                cx.background_spawn(async move { load_codex_available_skills(cwd).await });
+            let result = load_task.await;
+            this.update(cx, |this, cx| {
+                this.skills_refresh_task = None;
+                match result {
+                    Ok(skills) if this.available_skills_cwd.as_ref() == Some(&loaded_cwd) => {
+                        this.available_skills = skills;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        log::warn!("failed to load Codex skills: {error}");
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn notify_thread_changed(&mut self, cx: &mut Context<Self>) {
@@ -2516,14 +2675,17 @@ impl AgentsSurface {
         attachments: Vec<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Option<HarnessTurnInput> {
+        let path_style = self.workspace.read(cx).path_style(cx);
+        let skill_mentions = self.resolve_skill_mentions(&text, cx);
+        let sanitized_text = sanitize_skill_mentions(&text, path_style);
         let thread = self.thread_mut(&thread_id)?;
 
         if thread.messages.is_empty() {
             let attachment_fallback = attachments
                 .first()
                 .map(|first| attachment_display_name(first).to_string());
-            let title_source: &str = if !text.is_empty() {
-                text.as_str()
+            let title_source: &str = if !sanitized_text.is_empty() {
+                sanitized_text.as_str()
             } else if let Some(fallback) = attachment_fallback.as_deref() {
                 fallback
             } else {
@@ -2539,7 +2701,7 @@ impl AgentsSurface {
                 .into();
         }
 
-        let combined_input = build_input_with_attachments(&text, &attachments);
+        let combined_input = build_input_with_attachments(&sanitized_text, &attachments);
 
         // Pre-turn estimate is only used until codex reports real usage via
         // turn/completed; once we have real numbers we stop accumulating
@@ -2549,7 +2711,7 @@ impl AgentsSurface {
         }
         thread.messages.push(TranscriptMessage {
             role: TranscriptRole::User,
-            text,
+            text: sanitized_text,
             attachments,
             started_at: None,
             duration_ms: None,
@@ -2559,6 +2721,7 @@ impl AgentsSurface {
 
         Some(HarnessTurnInput {
             input: combined_input,
+            skill_mentions,
             model: self.selected_model.clone(),
             reasoning_effort: self.selected_reasoning_effort.clone(),
             approval_policy: HarnessApprovalPolicy::Never,
@@ -2575,6 +2738,31 @@ impl AgentsSurface {
                     attachments.push(path);
                 }
                 attachments
+            })
+    }
+
+    fn resolve_skill_mentions(&self, text: &str, cx: &App) -> Vec<HarnessSkillMention> {
+        parse_skill_mention_spans(text, self.workspace.read(cx).path_style(cx))
+            .into_iter()
+            .filter_map(|mention| {
+                let path = mention.path.or_else(|| {
+                    self.available_skills
+                        .iter()
+                        .find(|skill| skill.name.as_ref() == mention.name && skill.path.is_some())
+                        .and_then(|skill| skill.path.clone())
+                })?;
+                Some(HarnessSkillMention {
+                    name: mention.name,
+                    path,
+                })
+            })
+            .fold(Vec::new(), |mut mentions, mention| {
+                if !mentions.iter().any(|existing| {
+                    existing.name == mention.name && existing.path == mention.path
+                }) {
+                    mentions.push(mention);
+                }
+                mentions
             })
     }
 
@@ -3649,9 +3837,12 @@ impl EventEmitter<AgentsSurfaceEvent> for AgentsSurface {}
 
 #[cfg(test)]
 mod tests {
+    use util::paths::PathStyle;
+
     use super::{
-        FileMentionQuery, FileMentionSpan, format_file_mention, parse_file_mention_spans,
-        parse_file_mentions,
+        FileMentionQuery, FileMentionSpan, SkillMentionSpan, format_file_mention,
+        parse_file_mention_spans, parse_file_mentions, parse_skill_mention_spans,
+        sanitize_skill_mentions,
     };
 
     #[test]
@@ -3720,6 +3911,32 @@ mod tests {
                 source_range: 8..24,
                 query: Some("src/my file.rs".to_string()),
             })
+        );
+    }
+
+    #[test]
+    fn parses_skill_mention_spans() {
+        assert_eq!(
+            parse_skill_mention_spans(
+                "Use [@Linear Workflow](zed:///agent/skill/Linear%20Workflow?description=Linear+MCP+integration&path=%2Ftmp%2Fskill%2FSKILL.md)",
+                PathStyle::local(),
+            ),
+            vec![SkillMentionSpan {
+                source_range: 4..126,
+                name: "Linear Workflow".to_string(),
+                path: Some("/tmp/skill/SKILL.md".into()),
+            }]
+        );
+    }
+
+    #[test]
+    fn sanitizes_skill_mentions_for_display() {
+        assert_eq!(
+            sanitize_skill_mentions(
+                "Use [@Linear Workflow](zed:///agent/skill/Linear%20Workflow?description=Linear+MCP+integration) next",
+                PathStyle::local(),
+            ),
+            "Use $Linear Workflow next"
         );
     }
 }

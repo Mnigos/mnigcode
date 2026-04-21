@@ -81,10 +81,30 @@ pub struct HarnessSessionConfig {
 #[derive(Clone, Debug)]
 pub struct HarnessTurnInput {
     pub input: String,
+    pub skill_mentions: Vec<HarnessSkillMention>,
     pub model: String,
     pub reasoning_effort: String,
     pub approval_policy: HarnessApprovalPolicy,
     pub sandbox_policy: HarnessSandboxPolicy,
+}
+
+#[derive(Clone, Debug)]
+pub struct HarnessSkillMention {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HarnessSkillDefinition {
+    pub name: SharedString,
+    pub description: SharedString,
+    pub path: Option<PathBuf>,
+    pub source: HarnessSkillSource,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum HarnessSkillSource {
+    Local,
 }
 
 #[derive(Clone, Debug)]
@@ -155,6 +175,87 @@ pub async fn run_codex_app_server_session(
         )
         .await;
     }
+}
+
+pub async fn load_codex_available_skills(cwd: PathBuf) -> Result<Vec<HarnessSkillDefinition>> {
+    let mut command = Command::new("codex");
+    command
+        .arg("app-server")
+        .current_dir(&cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+
+    let mut child = command.spawn().with_context(|| {
+        format!("failed to start `codex app-server` in {}", cwd.display())
+    })?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .context("codex app-server stdin was not available")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("codex app-server stdout was not available")?;
+
+    let mut writer = BufWriter::new(stdin);
+    let mut reader = BufReader::new(stdout);
+    let mut next_request_id: i64 = 1;
+
+    let initialize_id = next_request_id;
+    next_request_id += 1;
+    write_message(
+        &mut writer,
+        json!({
+            "method": "initialize",
+            "id": initialize_id,
+            "params": {
+                "clientInfo": {
+                    "name": "mnig_code",
+                    "title": "Mnig Code",
+                    "version": "0.1.0",
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                },
+            },
+        }),
+    )
+    .await?;
+    read_until_app_server_response(&mut reader, &mut writer, initialize_id).await?;
+
+    write_message(
+        &mut writer,
+        json!({
+            "method": "initialized",
+            "params": {},
+        }),
+    )
+    .await?;
+
+    let skills_id = next_request_id;
+    write_message(
+        &mut writer,
+        json!({
+            "method": "skills/list",
+            "id": skills_id,
+            "params": {
+                "cwds": [cwd.to_string_lossy()],
+                "forceReload": false,
+            },
+        }),
+    )
+    .await?;
+    let skills_result = read_until_app_server_response(&mut reader, &mut writer, skills_id).await?;
+
+    let mut skills = Vec::new();
+    append_codex_skills(&mut skills, &skills_result);
+
+    child.kill().ok();
+    deduplicate_skills(&mut skills);
+    Ok(skills)
 }
 
 async fn run_codex_app_server_session_impl(
@@ -304,6 +405,19 @@ async fn run_codex_app_server_session_impl(
 
         let turn_start_id = next_request_id;
         next_request_id += 1;
+        let mut input = vec![json!({
+            "type": "text",
+            "text": turn.input,
+            "text_elements": [],
+        })];
+        input.extend(turn.skill_mentions.into_iter().map(|skill| {
+            json!({
+                "type": "skill",
+                "name": skill.name,
+                "path": skill.path.to_string_lossy(),
+            })
+        }));
+
         write_message(
             &mut writer,
             json!({
@@ -311,12 +425,7 @@ async fn run_codex_app_server_session_impl(
                 "id": turn_start_id,
                 "params": {
                     "threadId": provider_thread_id,
-                    "input": [
-                        {
-                            "type": "text",
-                            "text": turn.input,
-                        },
-                    ],
+                    "input": input,
                     "cwd": config.cwd.to_string_lossy(),
                     "model": turn.model,
                     "effort": turn.reasoning_effort,
@@ -368,6 +477,46 @@ where
             handle_protocol_message(message, writer, thread_id, updates, Some(expected_id)).await?
         {
             return Ok(result);
+        }
+    }
+}
+
+async fn read_until_app_server_response<Reader, Writer>(
+    reader: &mut BufReader<Reader>,
+    writer: &mut BufWriter<Writer>,
+    expected_id: i64,
+) -> Result<Value>
+where
+    Reader: AsyncRead + Unpin,
+    Writer: AsyncWrite + Unpin,
+{
+    loop {
+        let Some(message) = read_message(reader).await? else {
+            bail!("codex app-server exited before responding");
+        };
+
+        if let Some(method) = message.get("method").and_then(Value::as_str) {
+            if let Some(request_id) = message.get("id").cloned() {
+                respond_to_server_request(writer, request_id, method).await?;
+            }
+            continue;
+        }
+
+        if let Some(response_id) = message.get("id").and_then(Value::as_i64)
+            && response_id == expected_id
+        {
+            if let Some(error) = message.get("error") {
+                let message = error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("codex app-server request failed");
+                bail!("{message}");
+            }
+
+            return message
+                .get("result")
+                .cloned()
+                .ok_or_else(|| anyhow!("codex app-server response did not include a result"));
         }
     }
 }
@@ -1048,6 +1197,50 @@ fn tool_title(
     }
 
     base
+}
+
+fn append_codex_skills(skills: &mut Vec<HarnessSkillDefinition>, result: &Value) {
+    let Some(entries) = result.get("data").and_then(Value::as_array) else {
+        return;
+    };
+
+    for entry in entries {
+        let Some(skill_entries) = entry.get("skills").and_then(Value::as_array) else {
+            continue;
+        };
+
+        for skill in skill_entries {
+            if skill
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .is_some_and(|enabled| !enabled)
+            {
+                continue;
+            }
+
+            let Some(name) = skill.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let description = skill
+                .get("description")
+                .and_then(Value::as_str)
+                .or_else(|| skill.get("shortDescription").and_then(Value::as_str))
+                .unwrap_or("Codex skill");
+            let path = skill.get("path").and_then(Value::as_str).map(PathBuf::from);
+
+            skills.push(HarnessSkillDefinition {
+                name: name.to_string().into(),
+                description: description.to_string().into(),
+                path,
+                source: HarnessSkillSource::Local,
+            });
+        }
+    }
+}
+
+fn deduplicate_skills(skills: &mut Vec<HarnessSkillDefinition>) {
+    let mut seen = std::collections::HashSet::new();
+    skills.retain(|skill| seen.insert((skill.source, skill.name.to_string(), skill.path.clone())));
 }
 
 async fn respond_to_server_request<Writer>(

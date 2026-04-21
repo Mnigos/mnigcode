@@ -13511,6 +13511,7 @@ dependencies = [
  "smol",
  "terminal_view",
  "ui",
+ "url",
  "util",
  "workspace",
 ]
