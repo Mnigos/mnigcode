@@ -13497,6 +13497,7 @@ dependencies = [
  "anyhow",
  "editor",
  "futures 0.3.32",
+ "fuzzy",
  "gpui",
  "language",
  "log",
@@ -13508,6 +13509,7 @@ dependencies = [
  "smol",
  "terminal_view",
  "ui",
+ "util",
  "workspace",
 ]
 
