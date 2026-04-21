@@ -319,15 +319,35 @@ impl ComposerFileCompletionProvider {
         let Some(surface) = self.surface.upgrade() else {
             return Task::ready(Vec::new());
         };
-        let skills = surface.read(cx).skills.clone();
-        if skills.is_empty() {
-            return Task::ready(Vec::new());
-        }
-        if query.is_empty() {
-            return Task::ready(skills);
-        }
+        let project = surface.read(cx).workspace.read(cx).project().clone();
+        let servers = project.read(cx).context_server_store().read(cx).running_servers();
 
         cx.spawn(async move |cx| {
+            let mut skills = Vec::new();
+            for server in servers {
+                let Some(client) = server.client() else {
+                    continue;
+                };
+                if let Ok(response) = client
+                    .request::<context_server::types::requests::ListTools>(())
+                    .await
+                {
+                    for tool in response.tools {
+                        let description = tool
+                            .description
+                            .unwrap_or_default();
+                        skills.push(SkillDefinition {
+                            name: SharedString::from(tool.name),
+                            description: SharedString::from(description),
+                        });
+                    }
+                }
+            }
+
+            if query.is_empty() {
+                return skills;
+            }
+
             let candidates: Vec<_> = skills
                 .iter()
                 .enumerate()
@@ -2041,7 +2061,6 @@ pub struct AgentsSurface {
     selected_reasoning_effort: String,
     selected_sandbox_policy: HarnessSandboxPolicy,
     codex_sessions: HashMap<HarnessThreadId, CodexSessionHandle>,
-    pub skills: Vec<SkillDefinition>,
     streaming_notify_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
@@ -2142,7 +2161,6 @@ impl AgentsSurface {
             selected_reasoning_effort: DEFAULT_REASONING_EFFORT.to_string(),
             selected_sandbox_policy: HarnessSandboxPolicy::DangerFullAccess,
             codex_sessions: HashMap::new(),
-            skills: Vec::new(),
             streaming_notify_task: None,
             _subscriptions: vec![
                 active_workspace_subscription,
@@ -2150,45 +2168,8 @@ impl AgentsSurface {
                 composer_subscription,
             ],
         };
-        this.refresh_skills(cx);
         this.sync_transcript_view(cx);
         this
-    }
-
-    fn refresh_skills(&mut self, cx: &mut Context<Self>) {
-        let project = self.workspace.read(cx).project().clone();
-        let store = project.read(cx).context_server_store();
-        let servers = store.read(cx).running_servers();
-
-        cx.spawn(async move |this, cx| {
-            let mut skills = Vec::new();
-            for server in servers {
-                let Some(client) = server.client() else {
-                    continue;
-                };
-                let server_id = server.id();
-                if let Ok(response) = client
-                    .request::<context_server::types::requests::ListTools>(())
-                    .await
-                {
-                    for tool in response.tools {
-                        let description = tool
-                            .description
-                            .unwrap_or_else(|| format!("{} tool", server_id.0));
-                        skills.push(SkillDefinition {
-                            name: SharedString::from(tool.name),
-                            description: SharedString::from(description),
-                        });
-                    }
-                }
-            }
-            this.update(cx, |this, cx| {
-                this.skills = skills;
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
     }
 
     /// Coalesce rapid streaming updates into at most one re-render per
