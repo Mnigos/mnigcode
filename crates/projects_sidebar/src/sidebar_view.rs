@@ -216,16 +216,37 @@ impl ProjectsSidebar {
     fn subscribe_to_workspace(
         &mut self,
         workspace: &Entity<workspace::Workspace>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.subscribed_workspaces.insert(workspace.entity_id()) {
             return;
         }
 
-        let subscription = cx.subscribe(
+        let subscription = cx.subscribe_in(
             workspace,
-            |_this, _workspace, _event: &workspace::Event, cx| {
+            window,
+            |this, workspace, event: &workspace::Event, window, cx| {
+                if this.mode == WorkspaceMode::Agents
+                    && matches!(event, workspace::Event::ActiveItemChanged)
+                {
+                    let active_item_focus_handle = workspace
+                        .read(cx)
+                        .active_pane()
+                        .read(cx)
+                        .active_item()
+                        .map(|item| item.item_focus_handle(cx));
+
+                    if active_item_focus_handle
+                        .is_some_and(|focus_handle| focus_handle.contains_focused(window, cx))
+                    {
+                        cx.defer_in(window, |this, window, cx| {
+                            if this.mode == WorkspaceMode::Agents {
+                                this.set_mode(WorkspaceMode::Editor, window, cx);
+                            }
+                        });
+                    }
+                }
                 cx.notify();
             },
         );
