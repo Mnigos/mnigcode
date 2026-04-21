@@ -187,7 +187,7 @@ pub async fn load_codex_available_skills(cwd: PathBuf) -> Result<Vec<HarnessSkil
         .current_dir(&cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
 
     let mut child = command
@@ -202,13 +202,17 @@ pub async fn load_codex_available_skills(cwd: PathBuf) -> Result<Vec<HarnessSkil
         .stdout
         .take()
         .context("codex app-server stdout was not available")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("codex app-server stderr was not available")?;
+    smol::spawn(log_app_server_stderr(stderr)).detach();
 
     let mut writer = BufWriter::new(stdin);
     let mut reader = BufReader::new(stdout);
     let mut next_request_id: i64 = 1;
 
-    let initialize_id = next_request_id;
-    next_request_id += 1;
+    let initialize_id = next_app_server_request_id(&mut next_request_id);
     write_message(
         &mut writer,
         json!({
@@ -243,7 +247,7 @@ pub async fn load_codex_available_skills(cwd: PathBuf) -> Result<Vec<HarnessSkil
     )
     .await?;
 
-    let skills_id = next_request_id;
+    let skills_id = next_app_server_request_id(&mut next_request_id);
     write_message(
         &mut writer,
         json!({
@@ -269,6 +273,37 @@ pub async fn load_codex_available_skills(cwd: PathBuf) -> Result<Vec<HarnessSkil
     child.kill().ok();
     deduplicate_skills(&mut skills);
     Ok(skills)
+}
+
+fn next_app_server_request_id(next_request_id: &mut i64) -> i64 {
+    let request_id = *next_request_id;
+    *next_request_id += 1;
+    request_id
+}
+
+async fn log_app_server_stderr<Reader>(stderr: Reader)
+where
+    Reader: AsyncRead + Unpin,
+{
+    let mut reader = BufReader::new(stderr);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => break,
+            Ok(_) => {
+                let line = line.trim_end();
+                if !line.is_empty() {
+                    log::warn!("codex app-server stderr: {line}");
+                }
+            }
+            Err(error) => {
+                log::warn!("failed to read codex app-server stderr: {error}");
+                break;
+            }
+        }
+    }
 }
 
 async fn await_app_server_response<Fut, T>(

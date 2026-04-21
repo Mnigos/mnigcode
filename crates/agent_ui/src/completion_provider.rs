@@ -877,69 +877,11 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
     }
 
     fn search_skills(&self, query: String, cx: &mut App) -> Task<Vec<AvailableCommand>> {
-        let commands = self.source.available_skills(cx);
-        if commands.is_empty() {
-            return Task::ready(Vec::new());
-        }
-
-        if query.is_empty() {
-            return Task::ready(commands);
-        }
-
-        cx.spawn(async move |cx| {
-            let candidates = commands
-                .iter()
-                .enumerate()
-                .map(|(id, command)| StringMatchCandidate::new(id, &command.name))
-                .collect::<Vec<_>>();
-
-            let matches = fuzzy::match_strings(
-                &candidates,
-                &query,
-                false,
-                true,
-                100,
-                &Arc::new(AtomicBool::default()),
-                cx.background_executor().clone(),
-            )
-            .await;
-
-            matches
-                .into_iter()
-                .map(|mat| commands[mat.candidate_id].clone())
-                .collect()
-        })
+        fuzzy_match_commands(self.source.available_skills(cx), query, cx)
     }
 
     fn search_slash_commands(&self, query: String, cx: &mut App) -> Task<Vec<AvailableCommand>> {
-        let commands = self.source.available_commands(cx);
-        if commands.is_empty() {
-            return Task::ready(Vec::new());
-        }
-
-        cx.spawn(async move |cx| {
-            let candidates = commands
-                .iter()
-                .enumerate()
-                .map(|(id, command)| StringMatchCandidate::new(id, &command.name))
-                .collect::<Vec<_>>();
-
-            let matches = fuzzy::match_strings(
-                &candidates,
-                &query,
-                false,
-                true,
-                100,
-                &Arc::new(AtomicBool::default()),
-                cx.background_executor().clone(),
-            )
-            .await;
-
-            matches
-                .into_iter()
-                .map(|mat| commands[mat.candidate_id].clone())
-                .collect()
-        })
+        fuzzy_match_commands(self.source.available_commands(cx), query, cx)
     }
 
     fn fetch_branch_diff_match(
@@ -1307,6 +1249,40 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
 
         entries
     }
+}
+
+fn fuzzy_match_commands(
+    commands: Vec<AvailableCommand>,
+    query: String,
+    cx: &mut App,
+) -> Task<Vec<AvailableCommand>> {
+    if commands.is_empty() || query.is_empty() {
+        return Task::ready(commands);
+    }
+
+    cx.spawn(async move |cx| {
+        let candidates = commands
+            .iter()
+            .enumerate()
+            .map(|(id, command)| StringMatchCandidate::new(id, &command.name))
+            .collect::<Vec<_>>();
+
+        let matches = fuzzy::match_strings(
+            &candidates,
+            &query,
+            false,
+            true,
+            100,
+            &Arc::new(AtomicBool::default()),
+            cx.background_executor().clone(),
+        )
+        .await;
+
+        matches
+            .into_iter()
+            .map(|mat| commands[mat.candidate_id].clone())
+            .collect()
+    })
 }
 
 impl<T: PromptCompletionProviderDelegate> CompletionProvider for PromptCompletionProvider<T> {
