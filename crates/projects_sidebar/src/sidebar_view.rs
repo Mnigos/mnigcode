@@ -2,11 +2,7 @@ use gpui::{
     AnyElement, AnyView, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     PathPromptOptions, Pixels, Render, SharedString, Subscription, Task, WeakEntity, Window, px,
 };
-use std::{
-    collections::HashSet,
-    path::PathBuf,
-    time::Duration,
-};
+use std::{collections::HashSet, path::PathBuf, time::Duration};
 use ui::{CommonAnimationExt, Tooltip, prelude::*};
 use workspace::{
     MultiWorkspace, MultiWorkspaceEvent, OpenMode, ProjectGroup, Sidebar, SidebarEvent, SidebarSide,
@@ -111,9 +107,7 @@ impl ProjectsSidebar {
                         workspace.update(cx, |_, cx| {
                             cx.defer_in(window, |_, window, cx| {
                                 window.dispatch_action(
-                                    Box::new(
-                                        terminal_view::terminal_panel::Toggle,
-                                    ),
+                                    Box::new(terminal_view::terminal_panel::Toggle),
                                     cx,
                                 );
                             });
@@ -331,6 +325,86 @@ impl ProjectsSidebar {
         self.agents_surface.update(cx, |agents_surface, cx| {
             agents_surface.start_thread(workspace, cx);
         });
+    }
+
+    fn serialized_local_project_groups(&self, cx: &App) -> Vec<Vec<PathBuf>> {
+        self.multi_workspace
+            .upgrade()
+            .map(|multi_workspace| {
+                multi_workspace
+                    .read(cx)
+                    .project_groups(cx)
+                    .into_iter()
+                    .filter_map(|ProjectGroup { key, .. }| {
+                        if key.host().is_some() {
+                            return None;
+                        }
+
+                        let paths = key.path_list().ordered_paths().cloned().collect::<Vec<_>>();
+                        (!paths.is_empty()).then_some(paths)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn project_path_groups_to_restore(
+        serialized_project_groups: Vec<Vec<PathBuf>>,
+        thread_groups: &[crate::serialization::SerializedThreadGroup],
+    ) -> Vec<Vec<PathBuf>> {
+        let mut restored_groups = Vec::new();
+
+        let candidate_groups = if serialized_project_groups.is_empty() {
+            thread_groups
+                .iter()
+                .map(|group| {
+                    group
+                        .workspace_path
+                        .split('|')
+                        .filter(|path| !path.is_empty())
+                        .map(PathBuf::from)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        } else {
+            serialized_project_groups
+        };
+
+        for paths in candidate_groups {
+            if paths.is_empty()
+                || restored_groups
+                    .iter()
+                    .any(|existing: &Vec<PathBuf>| existing == &paths)
+            {
+                continue;
+            }
+            restored_groups.push(paths);
+        }
+
+        restored_groups
+    }
+
+    fn restore_projects_from_sidebar_state(
+        &mut self,
+        project_path_groups: Vec<Vec<PathBuf>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(multi_workspace) = self.multi_workspace.upgrade() else {
+            return;
+        };
+
+        if !multi_workspace.read(cx).project_groups(cx).is_empty() {
+            return;
+        }
+
+        for paths in project_path_groups.into_iter().rev() {
+            multi_workspace.update(cx, |multi_workspace, cx| {
+                multi_workspace
+                    .open_project(paths.clone(), OpenMode::Activate, window, cx)
+                    .detach_and_log_err(cx);
+            });
+        }
     }
 
     fn render_project_row(
@@ -596,11 +670,7 @@ impl workspace::Sidebar for ProjectsSidebar {
         self.set_mode(next, window, cx);
     }
 
-    fn new_thread_in_active_project(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn new_thread_in_active_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(workspace) = self.active_workspace(cx) else {
             return;
         };
@@ -616,11 +686,10 @@ impl workspace::Sidebar for ProjectsSidebar {
         let serialized = SerializedProjectsSidebar {
             mode: self.mode,
             thread_groups: agents_surface.serialize_threads(),
+            project_path_groups: self.serialized_local_project_groups(cx),
             next_thread_number: agents_surface.next_thread_number(),
             selected_model: Some(agents_surface.selected_model().to_string()),
-            selected_reasoning_effort: Some(
-                agents_surface.selected_reasoning_effort().to_string(),
-            ),
+            selected_reasoning_effort: Some(agents_surface.selected_reasoning_effort().to_string()),
             selected_sandbox_policy: Some(
                 agents_surface
                     .selected_sandbox_policy()
@@ -642,11 +711,14 @@ impl workspace::Sidebar for ProjectsSidebar {
                 let SerializedProjectsSidebar {
                     mode,
                     thread_groups,
+                    project_path_groups,
                     next_thread_number,
                     selected_model,
                     selected_reasoning_effort,
                     selected_sandbox_policy,
                 } = serialized;
+                let project_path_groups =
+                    Self::project_path_groups_to_restore(project_path_groups, &thread_groups);
                 self.mode = mode;
                 self.agents_surface.update(cx, |agents_surface, cx| {
                     agents_surface.restore_threads(thread_groups, cx);
@@ -665,6 +737,7 @@ impl workspace::Sidebar for ProjectsSidebar {
                     }
                 });
                 cx.defer_in(window, move |this, window, cx| {
+                    this.restore_projects_from_sidebar_state(project_path_groups, window, cx);
                     this.set_mode(mode, window, cx);
                 });
             }
@@ -684,28 +757,28 @@ impl Render for ProjectsSidebar {
                     .read(cx)
                     .project_groups(cx)
                     .into_iter()
-                    .map(|ProjectGroup { key, workspaces, .. }| {
-                        let paths: Vec<PathBuf> = key
-                            .path_list()
-                            .paths()
-                            .iter()
-                            .cloned()
-                            .collect();
-                        let storage_key = paths_storage_key(&paths);
-                        let display_name = key.display_name(&Default::default());
-                        let display_path = paths
-                            .first()
-                            .map(|path| path_display_label(path.as_ref()))
-                            .unwrap_or_else(|| "No folder opened".into());
-                        let loaded_workspace = workspaces.into_iter().next();
-                        ProjectListEntry {
-                            storage_key,
-                            display_name,
-                            display_path,
-                            paths,
-                            loaded_workspace,
-                        }
-                    })
+                    .map(
+                        |ProjectGroup {
+                             key, workspaces, ..
+                         }| {
+                            let paths: Vec<PathBuf> =
+                                key.path_list().paths().iter().cloned().collect();
+                            let storage_key = paths_storage_key(&paths);
+                            let display_name = key.display_name(&Default::default());
+                            let display_path = paths
+                                .first()
+                                .map(|path| path_display_label(path.as_ref()))
+                                .unwrap_or_else(|| "No folder opened".into());
+                            let loaded_workspace = workspaces.into_iter().next();
+                            ProjectListEntry {
+                                storage_key,
+                                display_name,
+                                display_path,
+                                paths,
+                                loaded_workspace,
+                            }
+                        },
+                    )
                     .collect()
             })
             .unwrap_or_default();
@@ -757,5 +830,69 @@ impl Render for ProjectsSidebar {
                     .overflow_hidden()
                     .children(project_elements),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use crate::serialization::SerializedThreadGroup;
+
+    use super::ProjectsSidebar;
+
+    #[test]
+    fn prefers_explicit_project_groups_when_present() {
+        let groups = ProjectsSidebar::project_path_groups_to_restore(
+            vec![
+                vec![PathBuf::from("/tmp/one")],
+                vec![PathBuf::from("/tmp/two"), PathBuf::from("/tmp/three")],
+            ],
+            &[SerializedThreadGroup {
+                workspace_path: "/tmp/fallback".to_string(),
+                active_thread_id: None,
+                threads: Vec::new(),
+            }],
+        );
+
+        assert_eq!(
+            groups,
+            vec![
+                vec![PathBuf::from("/tmp/one")],
+                vec![PathBuf::from("/tmp/two"), PathBuf::from("/tmp/three")],
+            ]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_thread_group_workspace_paths() {
+        let groups = ProjectsSidebar::project_path_groups_to_restore(
+            Vec::new(),
+            &[
+                SerializedThreadGroup {
+                    workspace_path: "/tmp/one".to_string(),
+                    active_thread_id: None,
+                    threads: Vec::new(),
+                },
+                SerializedThreadGroup {
+                    workspace_path: "/tmp/two|/tmp/three".to_string(),
+                    active_thread_id: None,
+                    threads: Vec::new(),
+                },
+                SerializedThreadGroup {
+                    workspace_path: "/tmp/one".to_string(),
+                    active_thread_id: None,
+                    threads: Vec::new(),
+                },
+            ],
+        );
+
+        assert_eq!(
+            groups,
+            vec![
+                vec![PathBuf::from("/tmp/one")],
+                vec![PathBuf::from("/tmp/two"), PathBuf::from("/tmp/three")],
+            ]
+        );
     }
 }
