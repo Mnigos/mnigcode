@@ -1355,6 +1355,40 @@ fn format_thinking_duration(duration_ms: u64) -> String {
     }
 }
 
+fn tool_status_after_phase(status: ToolStatus, phase: HarnessToolPhase) -> ToolStatus {
+    match (status, phase) {
+        (ToolStatus::Failed, _) => ToolStatus::Failed,
+        (ToolStatus::Completed, _) => ToolStatus::Completed,
+        (_, HarnessToolPhase::End) => ToolStatus::Completed,
+        _ => ToolStatus::Running,
+    }
+}
+
+fn complete_running_commands(thread: &mut HarnessThread) {
+    for message in &mut thread.messages {
+        let TranscriptRole::Tool {
+            kind: ToolDisplayKind::Command,
+            status,
+            ..
+        } = &mut message.role
+        else {
+            continue;
+        };
+
+        if *status != ToolStatus::Running {
+            continue;
+        }
+
+        *status = ToolStatus::Completed;
+        if message.duration_ms.is_none()
+            && let Some(started) = message.started_at.take()
+        {
+            message.duration_ms =
+                Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
+        }
+    }
+}
+
 fn should_show_role_header(
     index: usize,
     message: &TranscriptMessage,
@@ -1724,7 +1758,7 @@ impl TranscriptView {
         let has_body = !body.trim().is_empty();
         let is_running = status == ToolStatus::Running;
         let is_expandable = match kind {
-            ToolDisplayKind::Reasoning => has_body || is_running,
+            ToolDisplayKind::Reasoning => has_body,
             ToolDisplayKind::Command => true,
             _ => has_body || is_running,
         };
@@ -1869,6 +1903,8 @@ impl TranscriptView {
         if expanded {
             let body_element: AnyElement = if matches!(kind, ToolDisplayKind::Command) {
                 self.render_command_body(title, body, status, cx)
+            } else if has_body && matches!(kind, ToolDisplayKind::McpToolCall) {
+                self.render_mcp_tool_body(body, cx)
             } else if has_body && is_reasoning {
                 let source: SharedString = body.to_string().into();
                 let cache_key = (key.0.clone(), key.1);
@@ -2017,6 +2053,14 @@ impl TranscriptView {
             ToolStatus::Failed => (IconName::XCircle, "Failed", Color::Error),
             ToolStatus::Running => (IconName::LoadCircle, "Running", Color::Accent),
         };
+        let status_icon = Icon::new(status_icon)
+            .size(IconSize::XSmall)
+            .color(status_color);
+        let status_icon: AnyElement = if status == ToolStatus::Running {
+            status_icon.with_rotate_animation(2).into_any_element()
+        } else {
+            status_icon.into_any_element()
+        };
 
         card = card.child(
             h_flex()
@@ -2024,11 +2068,7 @@ impl TranscriptView {
                 .py_1p5()
                 .gap_1()
                 .justify_end()
-                .child(
-                    Icon::new(status_icon)
-                        .size(IconSize::XSmall)
-                        .color(status_color),
-                )
+                .child(status_icon)
                 .child(
                     Label::new(status_label)
                         .size(LabelSize::XSmall)
@@ -2037,6 +2077,36 @@ impl TranscriptView {
         );
 
         card.into_any_element()
+    }
+
+    fn render_mcp_tool_body(&self, body: &str, cx: &mut Context<Self>) -> AnyElement {
+        let colors = cx.theme().colors();
+        let content = body
+            .lines()
+            .filter_map(|line| {
+                if line.trim().is_empty() {
+                    return None;
+                }
+
+                Some(line.trim_end().to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        div()
+            .ml(px(20.0))
+            .px_2()
+            .py_1p5()
+            .rounded_md()
+            .bg(colors.element_background)
+            .border_1()
+            .border_color(colors.border)
+            .text_xs()
+            .font_buffer(cx)
+            .text_color(Color::Muted.color(cx))
+            .whitespace_normal()
+            .child(SharedString::from(content))
+            .into_any_element()
     }
 
     fn render_message_attachments(
@@ -2920,6 +2990,7 @@ impl AgentsSurface {
             HarnessTurnUpdate::AssistantDelta { thread_id, delta } => {
                 if let Some(thread) = self.thread_mut(&thread_id) {
                     thread.run_status = HarnessRunStatus::Running;
+                    complete_running_commands(thread);
                     if !thread.has_reported_tokens {
                         thread.estimated_tokens_used += delta.len() / 4;
                     }
@@ -2944,6 +3015,9 @@ impl AgentsSurface {
                 if let Some(thread) = self.thread_mut(&thread_id) {
                     thread.run_status = HarnessRunStatus::Running;
                     let display_kind = ToolDisplayKind::from_harness(&kind);
+                    if display_kind != ToolDisplayKind::Command {
+                        complete_running_commands(thread);
+                    }
 
                     let existing = thread.messages.iter_mut().rev().find(|message| {
                         match (&message.role, item_id.as_ref()) {
@@ -2983,10 +3057,7 @@ impl AgentsSurface {
                             if !title.is_empty() {
                                 *existing_title = title.clone();
                             }
-                            let next_status = match phase {
-                                HarnessToolPhase::End => ToolStatus::Completed,
-                                _ => ToolStatus::Running,
-                            };
+                            let next_status = tool_status_after_phase(*status, phase);
                             if *status == ToolStatus::Running && next_status != ToolStatus::Running
                             {
                                 transitioned_to_terminal = true;
@@ -3013,7 +3084,9 @@ impl AgentsSurface {
                             // treat it as a delta.
                             let use_snapshot_merge = matches!(
                                 display_kind,
-                                ToolDisplayKind::Reasoning | ToolDisplayKind::Command
+                                ToolDisplayKind::Reasoning
+                                    | ToolDisplayKind::Command
+                                    | ToolDisplayKind::McpToolCall
                             );
                             if use_snapshot_merge
                                 && detail.as_ref().starts_with(message.text.as_str())
@@ -3978,8 +4051,13 @@ mod tests {
 
     use super::{
         ComposerQuery, FileMentionQuery, FileMentionSpan, SkillMentionQuery, SkillMentionSpan,
-        format_file_mention, mask_skill_mentions, parse_file_mention_spans, parse_file_mentions,
-        parse_skill_mention_spans, sanitize_skill_mentions,
+        complete_running_commands, format_file_mention, mask_skill_mentions,
+        parse_file_mention_spans, parse_file_mentions, parse_skill_mention_spans,
+        sanitize_skill_mentions, tool_status_after_phase,
+    };
+    use crate::{
+        harness::{HarnessKind, HarnessRunStatus, HarnessThreadId, HarnessToolPhase},
+        transcript::{HarnessThread, ToolDisplayKind, ToolStatus, TranscriptMessage, TranscriptRole},
     };
 
     #[test]
@@ -3988,6 +4066,84 @@ mod tests {
             parse_file_mentions("please check @src/main.rs and @crates/app/lib.rs"),
             vec!["src/main.rs", "crates/app/lib.rs"]
         );
+    }
+
+    #[test]
+    fn keeps_terminal_tool_statuses_sticky() {
+        assert_eq!(
+            tool_status_after_phase(ToolStatus::Running, HarnessToolPhase::End),
+            ToolStatus::Completed
+        );
+        assert_eq!(
+            tool_status_after_phase(ToolStatus::Completed, HarnessToolPhase::Update),
+            ToolStatus::Completed
+        );
+        assert_eq!(
+            tool_status_after_phase(ToolStatus::Completed, HarnessToolPhase::Start),
+            ToolStatus::Completed
+        );
+        assert_eq!(
+            tool_status_after_phase(ToolStatus::Failed, HarnessToolPhase::End),
+            ToolStatus::Failed
+        );
+    }
+
+    #[test]
+    fn completes_running_commands_when_model_continues() {
+        let mut thread = HarnessThread {
+            id: HarnessThreadId("thread-1".into()),
+            provider_thread_id: None,
+            title: "Thread".into(),
+            cwd: Default::default(),
+            harness_kind: HarnessKind::Codex,
+            run_status: HarnessRunStatus::Running,
+            messages: vec![
+                {
+                    let mut message = TranscriptMessage::new(
+                        TranscriptRole::Tool {
+                            item_id: Some("cmd-1".to_string()),
+                            kind: ToolDisplayKind::Command,
+                            status: ToolStatus::Running,
+                            title: "Run command: pwd".into(),
+                        },
+                        String::new(),
+                    );
+                    message.started_at = Some(std::time::Instant::now());
+                    message
+                },
+                TranscriptMessage::new(
+                    TranscriptRole::Tool {
+                        item_id: Some("edit-1".to_string()),
+                        kind: ToolDisplayKind::FileChange,
+                        status: ToolStatus::Running,
+                        title: "Edit file".into(),
+                    },
+                    String::new(),
+                ),
+            ],
+            estimated_tokens_used: 0,
+            has_reported_tokens: false,
+        };
+
+        complete_running_commands(&mut thread);
+
+        match &thread.messages[0].role {
+            TranscriptRole::Tool {
+                status,
+                kind: ToolDisplayKind::Command,
+                ..
+            } => assert_eq!(*status, ToolStatus::Completed),
+            _ => panic!("expected command tool message"),
+        }
+        assert!(thread.messages[0].duration_ms.is_some());
+        match &thread.messages[1].role {
+            TranscriptRole::Tool {
+                status,
+                kind: ToolDisplayKind::FileChange,
+                ..
+            } => assert_eq!(*status, ToolStatus::Running),
+            _ => panic!("expected file change tool message"),
+        }
     }
 
     #[test]
