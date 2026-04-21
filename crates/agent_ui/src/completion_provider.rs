@@ -2432,6 +2432,28 @@ mod tests {
     }
 
     #[test]
+    fn test_prompt_completion_prefers_rightmost_active_trigger() {
+        let supported_modes = vec![PromptContextType::File, PromptContextType::Symbol];
+
+        assert_eq!(
+            PromptCompletion::try_parse("/test @file", 0, &supported_modes),
+            Some(PromptCompletion::Mention(MentionCompletion {
+                source_range: 6..11,
+                mode: Some(PromptContextType::File),
+                argument: None,
+            }))
+        );
+
+        assert_eq!(
+            PromptCompletion::try_parse("/test $linear", 0, &supported_modes),
+            Some(PromptCompletion::Skill(SkillCompletion {
+                source_range: 6..13,
+                query: Some("linear".to_string()),
+            }))
+        );
+    }
+
+    #[test]
     fn test_slash_command_completion_parse() {
         assert_eq!(
             SlashCommandCompletion::try_parse("/", 0),

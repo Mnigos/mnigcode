@@ -4104,11 +4104,18 @@ mod tests {
 
     #[test]
     fn masks_skill_mentions_before_file_parsing() {
-        let masked = mask_skill_mentions(
-            "Use [@Linear Workflow](zed:///agent/skill/Linear%20Workflow) with @src/main.rs",
-            PathStyle::local(),
-        );
+        let text = "Use [@Linear Workflow](zed:///agent/skill/Linear%20Workflow) with @src/main.rs";
+        let masked = mask_skill_mentions(text, PathStyle::local());
 
+        assert_eq!(masked.len(), text.len());
         assert_eq!(parse_file_mentions(&masked), vec!["src/main.rs"]);
+        assert_eq!(
+            parse_file_mention_spans(&masked),
+            vec![FileMentionSpan {
+                source_range: text.find("@src/main.rs").unwrap()
+                    ..text.find("@src/main.rs").unwrap() + "@src/main.rs".len(),
+                path: "src/main.rs".to_string(),
+            }]
+        );
     }
 }
