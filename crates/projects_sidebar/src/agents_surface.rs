@@ -2443,6 +2443,7 @@ impl AgentsSurface {
         }
 
         self.available_skills_cwd = Some(cwd.clone());
+        self.available_skills.clear();
         self.available_skills_loaded = false;
         let loaded_cwd = cwd.clone();
         self.skills_refresh_task = Some(cx.spawn(async move |this, cx| {
@@ -2450,13 +2451,16 @@ impl AgentsSurface {
                 cx.background_spawn(async move { load_codex_available_skills(cwd).await });
             let result = load_task.await;
             this.update(cx, |this, cx| {
+                if this.available_skills_cwd.as_ref() != Some(&loaded_cwd) {
+                    return;
+                }
+
                 this.skills_refresh_task = None;
                 match result {
-                    Ok(skills) if this.available_skills_cwd.as_ref() == Some(&loaded_cwd) => {
+                    Ok(skills) => {
                         this.available_skills = skills;
                         this.available_skills_loaded = true;
                     }
-                    Ok(_) => {}
                     Err(error) => {
                         log::warn!("failed to load Codex skills: {error}");
                     }
@@ -2649,10 +2653,10 @@ impl AgentsSurface {
     }
 
     fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mentioned_attachments = self.resolve_mentioned_attachments(cx);
+        let text = self.composer_editor.read(cx).text(cx).trim().to_string();
+        let mentioned_attachments = self.resolve_mentioned_attachments(&text, cx);
         let has_attachments =
             !self.pending_attachments.is_empty() || !mentioned_attachments.is_empty();
-        let text = self.composer_editor.read(cx).text(cx).trim().to_string();
 
         if text.is_empty() && !has_attachments {
             return;
@@ -2847,10 +2851,8 @@ impl AgentsSurface {
         })
     }
 
-    fn resolve_mentioned_attachments(&self, cx: &App) -> Vec<PathBuf> {
-        let composer_text = self.composer_editor.read(cx).text(cx);
-        let composer_text =
-            sanitize_skill_mentions(&composer_text, self.workspace.read(cx).path_style(cx));
+    fn resolve_mentioned_attachments(&self, text: &str, cx: &App) -> Vec<PathBuf> {
+        let composer_text = sanitize_skill_mentions(text, self.workspace.read(cx).path_style(cx));
         parse_file_mentions(&composer_text)
             .into_iter()
             .filter_map(|mention| {
