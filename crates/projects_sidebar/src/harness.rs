@@ -129,6 +129,7 @@ pub enum HarnessToolKind {
     FileChange,
     WebSearch,
     Reasoning,
+    McpToolCall,
     Other(SharedString),
 }
 
@@ -626,6 +627,7 @@ fn parse_tool_event(method: &str, params: Option<&Value>) -> Option<ParsedToolEv
         "fileChange" | "file_change" | "edit" | "write" => HarnessToolKind::FileChange,
         "webSearch" | "web_search" => HarnessToolKind::WebSearch,
         "reasoning" => HarnessToolKind::Reasoning,
+        "mcpToolCall" | "mcp_tool_call" => HarnessToolKind::McpToolCall,
         other => HarnessToolKind::Other(other.to_string().into()),
     };
 
@@ -734,6 +736,10 @@ fn extract_tool_detail(
         }
         // Nothing useful on a pure "completed" event with no output field.
         let _ = phase_str;
+        return SharedString::default();
+    }
+
+    if matches!(kind, HarnessToolKind::McpToolCall) {
         return SharedString::default();
     }
 
@@ -948,6 +954,37 @@ fn reasoning_text(params: &Value, item_payload: Option<&Value>) -> Option<String
     }
 }
 
+fn mcp_tool_name(params: Option<&Value>) -> Option<(SharedString, SharedString)> {
+    let params = params?;
+    let item = params.get("item");
+
+    let tool: Option<String> = item
+        .and_then(|i| i.get("tool"))
+        .and_then(Value::as_str)
+        .or_else(|| item.and_then(|i| i.get("name")).and_then(Value::as_str))
+        .or_else(|| item.and_then(|i| i.get("toolName")).and_then(Value::as_str))
+        .or_else(|| params.get("tool").and_then(Value::as_str))
+        .or_else(|| params.get("name").and_then(Value::as_str))
+        .map(str::to_string);
+
+    let server: Option<String> = item
+        .and_then(|i| i.get("server"))
+        .and_then(Value::as_str)
+        .or_else(|| item.and_then(|i| i.get("serverLabel")).and_then(Value::as_str))
+        .or_else(|| params.get("server").and_then(Value::as_str))
+        .or_else(|| params.get("serverLabel").and_then(Value::as_str))
+        .map(str::to_string);
+
+    match (server, tool) {
+        (Some(server), Some(tool)) => {
+            Some((SharedString::from(server), SharedString::from(tool)))
+        }
+        (None, Some(tool)) => Some(("MCP".into(), SharedString::from(tool))),
+        (Some(server), None) => Some((SharedString::from(server), "tool call".into())),
+        (None, None) => None,
+    }
+}
+
 fn tool_title(
     kind: &HarnessToolKind,
     _phase: HarnessToolPhase,
@@ -959,6 +996,7 @@ fn tool_title(
         HarnessToolKind::FileChange => "Edit file".into(),
         HarnessToolKind::WebSearch => "Web search".into(),
         HarnessToolKind::Reasoning => "Reasoning".into(),
+        HarnessToolKind::McpToolCall => "MCP tool call".into(),
         HarnessToolKind::Other(name) => name.clone(),
     };
 
@@ -966,6 +1004,13 @@ fn tool_title(
         return base;
     };
     let item_payload = params.get("item");
+
+    if matches!(kind, HarnessToolKind::McpToolCall) {
+        if let Some((server, tool)) = mcp_tool_name(Some(params)) {
+            return format!("{server}: {tool}").into();
+        }
+        return base;
+    }
 
     // Commands: "Run command: ls -la"
     if matches!(kind, HarnessToolKind::Command) {
