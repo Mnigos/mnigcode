@@ -1469,7 +1469,14 @@ async fn drain_new_session_lines(
     pending_tool_names: &mut HashMap<String, String>,
     partial: &mut Vec<u8>,
 ) {
-    match read_new_session_lines(session_path, *offset) {
+    let session_path = session_path.to_path_buf();
+    let read_path = session_path.clone();
+    match smol::unblock({
+        let offset = *offset;
+        move || read_new_session_lines(&read_path, offset)
+    })
+    .await
+    {
         Ok(Some((new_offset, bytes))) => {
             *offset = new_offset;
             partial.extend_from_slice(&bytes);
