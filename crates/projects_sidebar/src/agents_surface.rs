@@ -1358,10 +1358,7 @@ fn tool_status_after_phase(status: ToolStatus, phase: HarnessToolPhase) -> ToolS
     }
 }
 
-fn complete_running_commands(
-    thread: &mut HarnessThread,
-    except_item_id: Option<&str>,
-) {
+fn complete_running_commands(thread: &mut HarnessThread, except_item_id: Option<&str>) {
     for message in &mut thread.messages {
         let TranscriptRole::Tool {
             item_id,
@@ -1407,7 +1404,11 @@ fn total_removed_lines(file_changes: &[HarnessFileChange]) -> usize {
 }
 
 fn normalized_file_change_path(path: &str) -> &Path {
-    Path::new(path.strip_prefix("file://").unwrap_or(path).trim_start_matches("./"))
+    Path::new(
+        path.strip_prefix("file://")
+            .unwrap_or(path)
+            .trim_start_matches("./"),
+    )
 }
 
 fn render_diff_line(line: &str, cx: &mut Context<TranscriptView>) -> AnyElement {
@@ -1419,10 +1420,7 @@ fn render_diff_line(line: &str, cx: &mut Context<TranscriptView>) -> AnyElement 
             Color::Success.color(cx).opacity(0.12),
         )
     } else if line.starts_with('-') && !line.starts_with("---") {
-        (
-            Color::Error.color(cx),
-            Color::Error.color(cx).opacity(0.12),
-        )
+        (Color::Error.color(cx), Color::Error.color(cx).opacity(0.12))
     } else if line.starts_with("@@") {
         (Color::Accent.color(cx), colors.element_background)
     } else {
@@ -1539,7 +1537,8 @@ fn command_group_range(
 }
 
 fn command_text_from_title(title: &SharedString) -> SharedString {
-    title.split_once(": ")
+    title
+        .split_once(": ")
         .map(|(_, command)| command.trim().to_string())
         .unwrap_or_default()
         .into()
@@ -1885,12 +1884,7 @@ impl TranscriptView {
         }
 
         if matches!(message.role, TranscriptRole::ChangeSummary) {
-            return self.render_change_summary_message(
-                thread_id,
-                index,
-                &message.file_changes,
-                cx,
-            );
+            return self.render_change_summary_message(thread_id, index, &message.file_changes, cx);
         }
 
         let colors = cx.theme().colors();
@@ -2060,18 +2054,17 @@ impl TranscriptView {
                     .into_any_element()
             }
         } else {
-            let (label_text, label_color) = if matches!(kind, ToolDisplayKind::FileChange)
-                && has_file_changes
-            {
-                (
-                    SharedString::from(format_file_change_count(file_changes.len())),
-                    Color::Default,
-                )
-            } else if let Some((primary, _)) = &summary {
-                (primary.clone(), Color::Default)
-            } else {
-                (title.clone(), Color::Default)
-            };
+            let (label_text, label_color) =
+                if matches!(kind, ToolDisplayKind::FileChange) && has_file_changes {
+                    (
+                        SharedString::from(format_file_change_count(file_changes.len())),
+                        Color::Default,
+                    )
+                } else if let Some((primary, _)) = &summary {
+                    (primary.clone(), Color::Default)
+                } else {
+                    (title.clone(), Color::Default)
+                };
             Label::new(label_text)
                 .size(LabelSize::Small)
                 .color(label_color)
@@ -2374,10 +2367,7 @@ impl TranscriptView {
         if expanded {
             for (offset, message) in messages.iter().enumerate() {
                 let index = range.start + offset;
-                let TranscriptRole::Tool {
-                    title, status, ..
-                } = &message.role
-                else {
+                let TranscriptRole::Tool { title, status, .. } = &message.role else {
                     continue;
                 };
                 column = column.child(self.render_command_group_item(
@@ -2413,43 +2403,39 @@ impl TranscriptView {
             IconName::ChevronRight
         };
         let (header_thread_id, header_index) = key;
-        let mut item = v_flex()
-            .w_full()
-            .gap_1()
-            .ml(px(20.0))
-            .child(
-                h_flex()
-                    .id(("command-group-item-header", index))
-                    .w_full()
-                    .gap_1p5()
-                    .items_center()
-                    .cursor_pointer()
-                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
-                        cx.stop_propagation();
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_tool_expansion(header_thread_id.clone(), header_index, cx);
-                    }))
-                    .child(
-                        Icon::new(chevron)
+        let mut item = v_flex().w_full().gap_1().ml(px(20.0)).child(
+            h_flex()
+                .id(("command-group-item-header", index))
+                .w_full()
+                .gap_1p5()
+                .items_center()
+                .cursor_pointer()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_tool_expansion(header_thread_id.clone(), header_index, cx);
+                }))
+                .child(
+                    Icon::new(chevron)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(command_item_label(title, status))
+                        .size(LabelSize::Small)
+                        .color(Color::Default)
+                        .truncate(),
+                )
+                .when(status == ToolStatus::Running, |this| {
+                    this.child(
+                        Icon::new(IconName::LoadCircle)
                             .size(IconSize::XSmall)
-                            .color(Color::Muted),
+                            .color(Color::Accent)
+                            .with_rotate_animation(2),
                     )
-                    .child(
-                        Label::new(command_item_label(title, status))
-                            .size(LabelSize::Small)
-                            .color(Color::Default)
-                            .truncate(),
-                    )
-                    .when(status == ToolStatus::Running, |this| {
-                        this.child(
-                            Icon::new(IconName::LoadCircle)
-                                .size(IconSize::XSmall)
-                                .color(Color::Accent)
-                                .with_rotate_animation(2),
-                        )
-                    }),
-            );
+                }),
+        );
 
         if expanded {
             item = item.child(self.render_command_body(title, body, status, cx));
@@ -3169,9 +3155,8 @@ impl AgentsSurface {
         let loaded_cwd = cwd.clone();
         self.skills_refresh_task = Some(cx.spawn(async move |this, cx| {
             let executor = cx.background_executor().clone();
-            let load_task = cx.background_spawn(async move {
-                load_codex_available_skills(cwd, executor).await
-            });
+            let load_task = cx
+                .background_spawn(async move { load_codex_available_skills(cwd, executor).await });
             let result = load_task.await;
             this.update(cx, |this, cx| {
                 if this.available_skills_cwd.as_ref() != Some(&loaded_cwd) {
@@ -3325,8 +3310,8 @@ impl AgentsSurface {
             harness_kind: HarnessKind::Codex,
             run_status: HarnessRunStatus::Idle,
             messages: Vec::new(),
-            estimated_tokens_used: 0,
-            has_reported_tokens: false,
+            tokens_used: 0,
+            model_context_window: None,
         };
 
         self.threads_by_path
@@ -3548,12 +3533,6 @@ impl AgentsSurface {
                 .into();
         }
 
-        // Pre-turn estimate is only used until codex reports real usage via
-        // turn/completed; once we have real numbers we stop accumulating
-        // guesses.
-        if !thread.has_reported_tokens {
-            thread.estimated_tokens_used += combined_input.len() / 4;
-        }
         thread.messages.push(TranscriptMessage {
             role: TranscriptRole::User,
             text,
@@ -3646,9 +3625,6 @@ impl AgentsSurface {
                 if let Some(thread) = self.thread_mut(&thread_id) {
                     thread.run_status = HarnessRunStatus::Running;
                     complete_running_commands(thread, None);
-                    if !thread.has_reported_tokens {
-                        thread.estimated_tokens_used += delta.len() / 4;
-                    }
                     match thread.messages.last_mut() {
                         Some(message) if matches!(message.role, TranscriptRole::Assistant) => {
                             message.text.push_str(&delta);
@@ -3788,13 +3764,14 @@ impl AgentsSurface {
                     }
                 }
             }
-            HarnessTurnUpdate::TokensUsed {
+            HarnessTurnUpdate::TokenUsage {
                 thread_id,
-                total_tokens,
+                tokens_used,
+                model_context_window,
             } => {
                 if let Some(thread) = self.thread_mut(&thread_id) {
-                    thread.estimated_tokens_used = total_tokens;
-                    thread.has_reported_tokens = true;
+                    thread.tokens_used = tokens_used;
+                    thread.model_context_window = model_context_window;
                 }
             }
             HarnessTurnUpdate::Finished { thread_id } => {
@@ -3927,8 +3904,8 @@ impl AgentsSurface {
                                     duration_ms: message.duration_ms,
                                 })
                                 .collect(),
-                            estimated_tokens: Some(thread.estimated_tokens_used),
-                            has_reported_tokens: thread.has_reported_tokens,
+                            tokens_used: Some(thread.tokens_used),
+                            model_context_window: thread.model_context_window,
                         })
                         .collect(),
                 })
@@ -4028,8 +4005,8 @@ impl AgentsSurface {
                     harness_kind: HarnessKind::Codex,
                     run_status: HarnessRunStatus::Idle,
                     messages,
-                    estimated_tokens_used: serialized.estimated_tokens.unwrap_or(0),
-                    has_reported_tokens: serialized.has_reported_tokens,
+                    tokens_used: serialized.tokens_used.unwrap_or(0),
+                    model_context_window: serialized.model_context_window,
                 });
             }
 
@@ -4568,18 +4545,23 @@ impl AgentsSurface {
 
     fn render_context_indicator(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let thread = self.active_thread(cx)?;
-        if thread.estimated_tokens_used == 0 {
+        let tokens_used = thread.tokens_used;
+        if tokens_used == 0 {
             return None;
         }
 
-        let max_tokens = model_context_window(&self.selected_model) as f32;
-        let used = thread.estimated_tokens_used as f32;
+        let max_token_count = thread
+            .model_context_window
+            .unwrap_or_else(|| model_context_window(&self.selected_model))
+            .max(1);
+        let max_tokens = max_token_count as f32;
+        let used = tokens_used as f32;
         let ratio = (used / max_tokens).clamp(0.0, 1.0);
         // Round up so that the moment the user spends any tokens, the bar
         // advertises at least 1%. Zero is only shown when the thread is empty.
         let percentage = (ratio * 100.0).ceil().min(100.0) as u32;
-        let used_label = format_token_count(thread.estimated_tokens_used);
-        let max_label = format_token_count(model_context_window(&self.selected_model));
+        let used_label = format_token_count(tokens_used);
+        let max_label = format_token_count(max_token_count);
         let bar_color = if percentage >= 85 {
             cx.theme().status().warning
         } else {
@@ -4588,6 +4570,7 @@ impl AgentsSurface {
         // Ensure the progress arc is visually perceptible even when usage is
         // still a tiny fraction of the window (new threads, first tokens).
         let display_value = (ratio.max(0.03) * max_tokens).min(max_tokens);
+        let token_label = format!("{used_label} / {max_label}");
         let tooltip_text =
             format!("{percentage}% context used ({used_label} / {max_label} tokens)");
 
@@ -4603,7 +4586,7 @@ impl AgentsSurface {
                         .progress_color(bar_color),
                 )
                 .child(
-                    Label::new(format!("{used_label} / {max_label}"))
+                    Label::new(token_label)
                         .size(LabelSize::XSmall)
                         .color(Color::Muted),
                 )
@@ -4753,13 +4736,17 @@ mod tests {
     use super::{
         ComposerQuery, FileMentionQuery, FileMentionSpan, SkillMentionQuery, SkillMentionSpan,
         complete_running_commands, format_file_mention, mask_skill_mentions, merge_file_changes,
-        should_show_role_header, summarize_file_changes,
         parse_file_mention_spans, parse_file_mentions, parse_skill_mention_spans,
-        sanitize_skill_mentions, tool_status_after_phase,
+        sanitize_skill_mentions, should_show_role_header, summarize_file_changes,
+        tool_status_after_phase,
     };
     use crate::{
-        harness::{HarnessFileChange, HarnessKind, HarnessRunStatus, HarnessThreadId, HarnessToolPhase},
-        transcript::{HarnessThread, ToolDisplayKind, ToolStatus, TranscriptMessage, TranscriptRole},
+        harness::{
+            HarnessFileChange, HarnessKind, HarnessRunStatus, HarnessThreadId, HarnessToolPhase,
+        },
+        transcript::{
+            HarnessThread, ToolDisplayKind, ToolStatus, TranscriptMessage, TranscriptRole,
+        },
     };
 
     #[test]
@@ -4831,8 +4818,8 @@ mod tests {
                     String::new(),
                 ),
             ],
-            estimated_tokens_used: 0,
-            has_reported_tokens: false,
+            tokens_used: 0,
+            model_context_window: None,
         };
 
         complete_running_commands(&mut thread, None);
@@ -4889,8 +4876,8 @@ mod tests {
                     String::new(),
                 ),
             ],
-            estimated_tokens_used: 0,
-            has_reported_tokens: false,
+            tokens_used: 0,
+            model_context_window: None,
         };
 
         complete_running_commands(&mut thread, Some("cmd-2"));

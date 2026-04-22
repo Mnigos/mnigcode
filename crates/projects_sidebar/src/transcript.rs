@@ -17,8 +17,8 @@ pub(crate) struct HarnessThread {
     pub(crate) harness_kind: HarnessKind,
     pub(crate) run_status: HarnessRunStatus,
     pub(crate) messages: Vec<TranscriptMessage>,
-    pub(crate) estimated_tokens_used: usize,
-    pub(crate) has_reported_tokens: bool,
+    pub(crate) tokens_used: usize,
+    pub(crate) model_context_window: Option<usize>,
 }
 
 #[derive(Clone)]

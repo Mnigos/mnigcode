@@ -37,10 +37,10 @@ pub(crate) struct SerializedHarnessThread {
     pub(crate) title: String,
     pub(crate) cwd: PathBuf,
     pub(crate) messages: Vec<SerializedTranscriptMessage>,
+    #[serde(default, alias = "estimated_tokens", alias = "token_usage_total")]
+    pub(crate) tokens_used: Option<usize>,
     #[serde(default)]
-    pub(crate) estimated_tokens: Option<usize>,
-    #[serde(default)]
-    pub(crate) has_reported_tokens: bool,
+    pub(crate) model_context_window: Option<usize>,
 }
 
 #[derive(Deserialize, Serialize)]
