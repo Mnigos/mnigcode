@@ -1566,7 +1566,7 @@ async fn handle_parsed_command_event(
                         thread_id: thread_id.clone(),
                         item_id: Some(call_id),
                         kind: HarnessToolKind::Command,
-                        phase: HarnessToolPhase::Update,
+                        phase: HarnessToolPhase::End,
                         title: SharedString::default(),
                         detail: output.into(),
                         file_changes: Vec::new(),
@@ -2293,7 +2293,7 @@ mod tests {
                 } => {
                     assert_eq!(item_id.as_deref(), Some("call_456"));
                     assert_eq!(kind, HarnessToolKind::Command);
-                    assert_eq!(phase, super::HarnessToolPhase::Update);
+                    assert_eq!(phase, super::HarnessToolPhase::End);
                     assert_eq!(detail.as_ref(), "hello\nworld\n");
                 }
                 other => panic!("unexpected update: {other:?}"),
