@@ -126,6 +126,12 @@ pub enum HarnessSkillSource {
     Local,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HarnessTokenUsageSource {
+    Native,
+    Legacy,
+}
+
 #[derive(Clone, Debug)]
 pub enum HarnessTurnUpdate {
     Status {
@@ -153,6 +159,7 @@ pub enum HarnessTurnUpdate {
         thread_id: HarnessThreadId,
         tokens_used: usize,
         model_context_window: Option<usize>,
+        source: HarnessTokenUsageSource,
     },
     Finished {
         thread_id: HarnessThreadId,
@@ -785,12 +792,18 @@ async fn handle_notification(
             if let Some((tokens_used, model_context_window)) =
                 params.and_then(extract_thread_token_usage)
             {
+                let source = if method == "thread/tokenUsage/updated" {
+                    HarnessTokenUsageSource::Native
+                } else {
+                    HarnessTokenUsageSource::Legacy
+                };
                 send_update(
                     updates,
                     HarnessTurnUpdate::TokenUsage {
                         thread_id: thread_id.clone(),
                         tokens_used,
                         model_context_window,
+                        source,
                     },
                 )
                 .await;
@@ -2033,10 +2046,10 @@ mod tests {
     use smol::channel;
 
     use super::{
-        HarnessThreadId, HarnessToolKind, HarnessTurnUpdate, RawSessionCommandEvent,
-        extract_exec_command_output, extract_thread_token_usage, finalize_partial_command_record,
-        handle_notification, parse_raw_session_command_event, parse_tool_event,
-        read_new_session_lines,
+        HarnessThreadId, HarnessTokenUsageSource, HarnessToolKind, HarnessTurnUpdate,
+        RawSessionCommandEvent, extract_exec_command_output, extract_thread_token_usage,
+        finalize_partial_command_record, handle_notification, parse_raw_session_command_event,
+        parse_tool_event, read_new_session_lines,
     };
 
     #[test]
@@ -2413,10 +2426,12 @@ mod tests {
                     thread_id,
                     tokens_used,
                     model_context_window,
+                    source,
                 } => {
                     assert_eq!(thread_id, HarnessThreadId("thread-1".into()));
                     assert_eq!(tokens_used, 900);
                     assert_eq!(model_context_window, Some(256_000));
+                    assert_eq!(source, HarnessTokenUsageSource::Native);
                 }
                 other => panic!("unexpected update: {other:?}"),
             }
@@ -2447,10 +2462,12 @@ mod tests {
                     thread_id,
                     tokens_used,
                     model_context_window,
+                    source,
                 } => {
                     assert_eq!(thread_id, HarnessThreadId("thread-1".into()));
                     assert_eq!(tokens_used, 900);
                     assert_eq!(model_context_window, None);
+                    assert_eq!(source, HarnessTokenUsageSource::Legacy);
                 }
                 other => panic!("unexpected update: {other:?}"),
             }

@@ -39,7 +39,8 @@ use crate::COMPOSER_KEY_CONTEXT;
 use crate::harness::{
     HarnessApprovalPolicy, HarnessFileChange, HarnessKind, HarnessRunStatus, HarnessSandboxPolicy,
     HarnessSessionConfig, HarnessSkillDefinition as SkillDefinition, HarnessSkillMention,
-    HarnessThreadId, HarnessToolPhase, HarnessTurnInput, HarnessTurnUpdate,
+    HarnessThreadId, HarnessTokenUsageSource, HarnessToolPhase, HarnessTurnInput,
+    HarnessTurnUpdate,
     load_codex_available_skills, run_codex_app_server_session,
 };
 use crate::helpers::{
@@ -1355,6 +1356,27 @@ fn tool_status_after_phase(status: ToolStatus, phase: HarnessToolPhase) -> ToolS
         (_, HarnessToolPhase::Failed) => ToolStatus::Failed,
         (_, HarnessToolPhase::End) => ToolStatus::Completed,
         _ => ToolStatus::Running,
+    }
+}
+
+fn apply_token_usage(
+    thread: &mut HarnessThread,
+    tokens_used: usize,
+    model_context_window: Option<usize>,
+    source: HarnessTokenUsageSource,
+) {
+    if source == HarnessTokenUsageSource::Native {
+        thread.has_native_token_usage = true;
+    } else if thread.has_native_token_usage {
+        if let Some(model_context_window) = model_context_window {
+            thread.model_context_window = Some(model_context_window);
+        }
+        return;
+    }
+
+    thread.tokens_used = tokens_used;
+    if let Some(model_context_window) = model_context_window {
+        thread.model_context_window = Some(model_context_window);
     }
 }
 
@@ -3311,6 +3333,7 @@ impl AgentsSurface {
             run_status: HarnessRunStatus::Idle,
             messages: Vec::new(),
             tokens_used: 0,
+            has_native_token_usage: false,
             model_context_window: None,
         };
 
@@ -3768,10 +3791,10 @@ impl AgentsSurface {
                 thread_id,
                 tokens_used,
                 model_context_window,
+                source,
             } => {
                 if let Some(thread) = self.thread_mut(&thread_id) {
-                    thread.tokens_used = tokens_used;
-                    thread.model_context_window = model_context_window;
+                    apply_token_usage(thread, tokens_used, model_context_window, source);
                 }
             }
             HarnessTurnUpdate::Finished { thread_id } => {
@@ -4006,6 +4029,7 @@ impl AgentsSurface {
                     run_status: HarnessRunStatus::Idle,
                     messages,
                     tokens_used: serialized.tokens_used.unwrap_or(0),
+                    has_native_token_usage: false,
                     model_context_window: serialized.model_context_window,
                 });
             }
@@ -4735,19 +4759,52 @@ mod tests {
 
     use super::{
         ComposerQuery, FileMentionQuery, FileMentionSpan, SkillMentionQuery, SkillMentionSpan,
-        complete_running_commands, format_file_mention, mask_skill_mentions, merge_file_changes,
-        parse_file_mention_spans, parse_file_mentions, parse_skill_mention_spans,
-        sanitize_skill_mentions, should_show_role_header, summarize_file_changes,
-        tool_status_after_phase,
+        apply_token_usage, complete_running_commands, format_file_mention, mask_skill_mentions,
+        merge_file_changes, parse_file_mention_spans, parse_file_mentions,
+        parse_skill_mention_spans, sanitize_skill_mentions, should_show_role_header,
+        summarize_file_changes, tool_status_after_phase,
     };
     use crate::{
         harness::{
-            HarnessFileChange, HarnessKind, HarnessRunStatus, HarnessThreadId, HarnessToolPhase,
+            HarnessFileChange, HarnessKind, HarnessRunStatus, HarnessThreadId,
+            HarnessTokenUsageSource, HarnessToolPhase,
         },
         transcript::{
             HarnessThread, ToolDisplayKind, ToolStatus, TranscriptMessage, TranscriptRole,
         },
     };
+
+    #[test]
+    fn legacy_token_usage_does_not_overwrite_native_usage() {
+        let mut thread = HarnessThread {
+            id: HarnessThreadId("thread-1".into()),
+            provider_thread_id: None,
+            title: "Thread".into(),
+            cwd: Default::default(),
+            harness_kind: HarnessKind::Codex,
+            run_status: HarnessRunStatus::Idle,
+            messages: Vec::new(),
+            tokens_used: 900,
+            has_native_token_usage: false,
+            model_context_window: None,
+        };
+
+        apply_token_usage(
+            &mut thread,
+            900,
+            Some(256_000),
+            HarnessTokenUsageSource::Native,
+        );
+        apply_token_usage(
+            &mut thread,
+            3_700_000,
+            None,
+            HarnessTokenUsageSource::Legacy,
+        );
+
+        assert_eq!(thread.tokens_used, 900);
+        assert_eq!(thread.model_context_window, Some(256_000));
+    }
 
     #[test]
     fn parses_plain_file_mentions() {
@@ -4819,6 +4876,7 @@ mod tests {
                 ),
             ],
             tokens_used: 0,
+            has_native_token_usage: false,
             model_context_window: None,
         };
 
@@ -4877,6 +4935,7 @@ mod tests {
                 ),
             ],
             tokens_used: 0,
+            has_native_token_usage: false,
             model_context_window: None,
         };
 
