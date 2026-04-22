@@ -574,12 +574,21 @@ async fn run_codex_app_server_session_impl(
             (stop_tx, task)
         });
 
-        read_until_turn_finished(&mut reader, &mut writer, &config.thread_id, updates).await?;
+        let completed_thread_id =
+            read_until_turn_finished(&mut reader, &mut writer, &config.thread_id, updates).await?;
 
         if let Some((stop, task)) = raw_session_stream {
             stop.send(()).await.ok();
             task.await;
         }
+
+        send_update(
+            updates,
+            HarnessTurnUpdate::Finished {
+                thread_id: completed_thread_id,
+            },
+        )
+        .await;
     }
 
     child.kill().ok();
@@ -655,7 +664,7 @@ async fn read_until_turn_finished<Reader, Writer>(
     writer: &mut BufWriter<Writer>,
     thread_id: &HarnessThreadId,
     updates: &Sender<HarnessTurnUpdate>,
-) -> Result<()>
+) -> Result<HarnessThreadId>
 where
     Reader: AsyncRead + Unpin,
     Writer: AsyncWrite + Unpin,
@@ -673,7 +682,7 @@ where
         handle_protocol_message(message, writer, thread_id, updates, None).await?;
 
         if is_turn_completed {
-            return Ok(());
+            return Ok(thread_id.clone());
         }
     }
 }
@@ -771,13 +780,6 @@ async fn handle_notification(
                 )
                 .await;
             }
-            send_update(
-                updates,
-                HarnessTurnUpdate::Finished {
-                    thread_id: thread_id.clone(),
-                },
-            )
-            .await;
         }
         "error" => {
             let message = params
@@ -1442,6 +1444,13 @@ async fn stream_exec_command_outputs_from_session(
         )
         .await;
         if stop_requested {
+            finalize_partial_command_record(
+                &thread_id,
+                &updates,
+                &mut pending_tool_names,
+                &mut partial,
+            )
+            .await;
             break;
         }
 
@@ -1450,6 +1459,13 @@ async fn stream_exec_command_outputs_from_session(
             drain_new_session_lines(
                 &session_path,
                 &mut offset,
+                &thread_id,
+                &updates,
+                &mut pending_tool_names,
+                &mut partial,
+            )
+            .await;
+            finalize_partial_command_record(
                 &thread_id,
                 &updates,
                 &mut pending_tool_names,
@@ -1488,35 +1504,14 @@ async fn drain_new_session_lines(
                     continue;
                 }
 
-                match parse_raw_session_command_event(line) {
-                    Some(RawSessionCommandEvent::Started { call_id, tool_name }) => {
-                        pending_tool_names.insert(call_id, tool_name);
-                    }
-                    Some(RawSessionCommandEvent::Completed {
-                        call_id,
-                        tool_name,
-                        output,
-                    }) => {
-                        let pending_tool_name = pending_tool_names.remove(&call_id);
-                        if pending_tool_name.as_deref() == Some("exec_command")
-                            || tool_name.as_deref() == Some("exec_command")
-                        {
-                            send_update(
-                                updates,
-                                HarnessTurnUpdate::ToolEvent {
-                                    thread_id: thread_id.clone(),
-                                    item_id: Some(call_id),
-                                    kind: HarnessToolKind::Command,
-                                    phase: HarnessToolPhase::Update,
-                                    title: SharedString::default(),
-                                    detail: output.into(),
-                                    file_changes: Vec::new(),
-                                },
-                            )
-                            .await;
-                        }
-                    }
-                    None => {}
+                if let Some(event) = parse_raw_session_command_event(line) {
+                    handle_parsed_command_event(
+                        event,
+                        thread_id,
+                        updates,
+                        pending_tool_names,
+                    )
+                    .await;
                 }
             }
         }
@@ -1526,6 +1521,59 @@ async fn drain_new_session_lines(
                 "failed to read raw codex session output from {}: {error}",
                 session_path.display()
             );
+        }
+    }
+}
+
+async fn finalize_partial_command_record(
+    thread_id: &HarnessThreadId,
+    updates: &Sender<HarnessTurnUpdate>,
+    pending_tool_names: &mut HashMap<String, String>,
+    partial: &mut Vec<u8>,
+) {
+    if partial.is_empty() {
+        return;
+    }
+
+    if let Some(event) = parse_raw_session_command_event(partial.as_slice()) {
+        handle_parsed_command_event(event, thread_id, updates, pending_tool_names).await;
+    }
+    partial.clear();
+}
+
+async fn handle_parsed_command_event(
+    event: RawSessionCommandEvent,
+    thread_id: &HarnessThreadId,
+    updates: &Sender<HarnessTurnUpdate>,
+    pending_tool_names: &mut HashMap<String, String>,
+) {
+    match event {
+        RawSessionCommandEvent::Started { call_id, tool_name } => {
+            pending_tool_names.insert(call_id, tool_name);
+        }
+        RawSessionCommandEvent::Completed {
+            call_id,
+            tool_name,
+            output,
+        } => {
+            let pending_tool_name = pending_tool_names.remove(&call_id);
+            if pending_tool_name.as_deref() == Some("exec_command")
+                || tool_name.as_deref() == Some("exec_command")
+            {
+                send_update(
+                    updates,
+                    HarnessTurnUpdate::ToolEvent {
+                        thread_id: thread_id.clone(),
+                        item_id: Some(call_id),
+                        kind: HarnessToolKind::Command,
+                        phase: HarnessToolPhase::Update,
+                        title: SharedString::default(),
+                        detail: output.into(),
+                        file_changes: Vec::new(),
+                    },
+                )
+                .await;
+            }
         }
     }
 }
@@ -1958,9 +2006,11 @@ mod tests {
     };
 
     use serde_json::json;
+    use smol::channel;
 
     use super::{
-        HarnessToolKind, RawSessionCommandEvent, extract_exec_command_output,
+        HarnessToolKind, HarnessTurnUpdate, RawSessionCommandEvent,
+        extract_exec_command_output, finalize_partial_command_record,
         parse_raw_session_command_event, parse_tool_event, read_new_session_lines,
     };
 
@@ -2216,6 +2266,40 @@ mod tests {
         assert_eq!(new_offset, 11);
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn finalizes_partial_command_record_without_newline() {
+        smol::block_on(async {
+            let (updates_tx, updates_rx) = channel::unbounded();
+            let mut pending_tool_names = std::collections::HashMap::new();
+            let mut partial = br#"{"timestamp":"2026-04-21T20:06:06.945Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_456","aggregated_output":"hello\nworld\n","formatted_output":"","stdout":"","stderr":"","status":"completed"}}"#.to_vec();
+
+            finalize_partial_command_record(
+                &super::HarnessThreadId("thread-1".into()),
+                &updates_tx,
+                &mut pending_tool_names,
+                &mut partial,
+            )
+            .await;
+
+            match updates_rx.recv().await.unwrap() {
+                HarnessTurnUpdate::ToolEvent {
+                    item_id,
+                    kind,
+                    phase,
+                    detail,
+                    ..
+                } => {
+                    assert_eq!(item_id.as_deref(), Some("call_456"));
+                    assert_eq!(kind, HarnessToolKind::Command);
+                    assert_eq!(phase, super::HarnessToolPhase::Update);
+                    assert_eq!(detail.as_ref(), "hello\nworld\n");
+                }
+                other => panic!("unexpected update: {other:?}"),
+            }
+            assert!(partial.is_empty());
+        });
     }
 
     #[test]

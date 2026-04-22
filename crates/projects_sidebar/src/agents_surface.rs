@@ -1482,7 +1482,6 @@ fn summarize_file_changes(existing: &mut Vec<HarnessFileChange>, incoming: Vec<H
             existing_change.removed_lines += incoming_change.removed_lines;
             if let Some(diff) = incoming_change.unified_diff {
                 match &mut existing_change.unified_diff {
-                    Some(existing_diff) if existing_diff.contains(&diff) => {}
                     Some(existing_diff) if !existing_diff.is_empty() => {
                         existing_diff.push('\n');
                         existing_diff.push_str(&diff);
@@ -5006,6 +5005,32 @@ mod tests {
         assert_eq!(
             merged[0].unified_diff.as_deref(),
             Some("@@ -1 +1 @@\n-old\n+new\n@@ -10 +10,4 @@\n+extra")
+        );
+    }
+
+    #[test]
+    fn summary_merge_does_not_drop_substring_diff_segments() {
+        let mut merged = vec![HarnessFileChange {
+            path: "src/main.rs".into(),
+            added_lines: 2,
+            removed_lines: 0,
+            unified_diff: Some("@@ -1 +1,2 @@\n+alpha\n+beta".to_string()),
+        }];
+
+        summarize_file_changes(
+            &mut merged,
+            vec![HarnessFileChange {
+                path: "src/main.rs".into(),
+                added_lines: 1,
+                removed_lines: 0,
+                unified_diff: Some("+beta".to_string()),
+            }],
+        );
+
+        assert_eq!(merged[0].added_lines, 3);
+        assert_eq!(
+            merged[0].unified_diff.as_deref(),
+            Some("@@ -1 +1,2 @@\n+alpha\n+beta\n+beta")
         );
     }
 
