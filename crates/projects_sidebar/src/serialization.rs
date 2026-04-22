@@ -50,7 +50,20 @@ pub(crate) struct SerializedTranscriptMessage {
     #[serde(default)]
     pub(crate) attachments: Vec<PathBuf>,
     #[serde(default)]
+    pub(crate) file_changes: Vec<SerializedFileChange>,
+    #[serde(default)]
     pub(crate) duration_ms: Option<u64>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+pub(crate) struct SerializedFileChange {
+    pub(crate) path: String,
+    #[serde(default)]
+    pub(crate) added_lines: usize,
+    #[serde(default)]
+    pub(crate) removed_lines: usize,
+    #[serde(default)]
+    pub(crate) unified_diff: Option<String>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -59,6 +72,7 @@ pub(crate) enum SerializedTranscriptRole {
     User,
     Assistant,
     System,
+    ChangeSummary,
     Tool {
         title: String,
         #[serde(default)]

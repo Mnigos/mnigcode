@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::time::Instant;
 use ui::IconName;
 
-use crate::harness::{HarnessKind, HarnessRunStatus, HarnessThreadId, HarnessToolKind};
+use crate::harness::{
+    HarnessFileChange, HarnessKind, HarnessRunStatus, HarnessThreadId, HarnessToolKind,
+};
 
 #[derive(Clone)]
 pub(crate) struct HarnessThread {
@@ -34,6 +36,7 @@ pub(crate) struct TranscriptMessage {
     pub(crate) text: String,
     pub(crate) attachments: Vec<PathBuf>,
     pub(crate) file_mentions: Vec<ResolvedFileMention>,
+    pub(crate) file_changes: Vec<HarnessFileChange>,
     /// Wall-clock start time captured when the tool message first lands in
     /// the transcript. Only set for Tool messages; kept in-memory so the
     /// renderer can show "Thought for Xs" once the tool completes.
@@ -51,6 +54,7 @@ impl TranscriptMessage {
             text,
             attachments: Vec::new(),
             file_mentions: Vec::new(),
+            file_changes: Vec::new(),
             started_at: None,
             duration_ms: None,
         }
@@ -68,6 +72,7 @@ pub(crate) enum TranscriptRole {
     User,
     Assistant,
     System,
+    ChangeSummary,
     Tool {
         item_id: Option<String>,
         kind: ToolDisplayKind,
