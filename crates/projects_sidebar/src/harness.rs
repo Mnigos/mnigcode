@@ -558,10 +558,17 @@ async fn run_codex_app_server_session_impl(
         .await?;
         send_status(updates, config.thread_id.clone(), HarnessRunStatus::Running).await;
 
-        let raw_session_stream = raw_session_path.as_ref().map(|path| {
-            let start_offset = std::fs::metadata(path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0);
+        let raw_session_stream = if let Some(path) = raw_session_path.as_ref() {
+            let path = path.clone();
+            let start_offset = smol::unblock({
+                let path = path.clone();
+                move || {
+                    std::fs::metadata(path)
+                        .map(|metadata| metadata.len())
+                        .unwrap_or(0)
+                }
+            })
+            .await;
             let (stop_tx, stop_rx) = smol::channel::bounded(1);
             let task = smol::spawn(stream_exec_command_outputs_from_session(
                 path.clone(),
@@ -571,16 +578,20 @@ async fn run_codex_app_server_session_impl(
                 updates.clone(),
                 stop_rx,
             ));
-            (stop_tx, task)
-        });
+            Some((stop_tx, task))
+        } else {
+            None
+        };
 
-        let completed_thread_id =
-            read_until_turn_finished(&mut reader, &mut writer, &config.thread_id, updates).await?;
+        let turn_result =
+            read_until_turn_finished(&mut reader, &mut writer, &config.thread_id, updates).await;
 
         if let Some((stop, task)) = raw_session_stream {
             stop.send(()).await.ok();
             task.await;
         }
+
+        let completed_thread_id = turn_result?;
 
         send_update(
             updates,
@@ -701,7 +712,7 @@ where
         // Dispatch notifications first so method-driven updates (e.g.
         // turn/completed → Finished) are emitted even when the server sends
         // the method as a request that also requires a response.
-        handle_notification(method, message.get("params"), thread_id, updates).await;
+        handle_notification(method, message.get("params"), thread_id, updates).await?;
 
         if let Some(request_id) = message.get("id").cloned() {
             respond_to_server_request(writer, request_id, method).await?;
@@ -733,7 +744,7 @@ async fn handle_notification(
     params: Option<&Value>,
     thread_id: &HarnessThreadId,
     updates: &Sender<HarnessTurnUpdate>,
-) {
+) -> Result<()> {
     match method {
         "thread/started" => {
             if let Some(provider_thread_id) = params
@@ -787,14 +798,7 @@ async fn handle_notification(
                 .and_then(|error| error.get("message"))
                 .and_then(Value::as_str)
                 .unwrap_or("codex app-server reported an error");
-            send_update(
-                updates,
-                HarnessTurnUpdate::Failed {
-                    thread_id: thread_id.clone(),
-                    message: message.to_string().into(),
-                },
-            )
-            .await;
+            bail!("{message}");
         }
         other if other.starts_with("item/") => {
             if let Some(event) = parse_tool_event(other, params) {
@@ -856,7 +860,9 @@ async fn handle_notification(
         other => {
             log::debug!("unhandled codex notification: {other}");
         }
-    }
+    };
+
+    Ok(())
 }
 
 struct ParsedToolEvent {
@@ -2009,9 +2015,10 @@ mod tests {
     use smol::channel;
 
     use super::{
-        HarnessToolKind, HarnessTurnUpdate, RawSessionCommandEvent,
+        HarnessThreadId, HarnessToolKind, HarnessTurnUpdate, RawSessionCommandEvent,
         extract_exec_command_output, finalize_partial_command_record,
-        parse_raw_session_command_event, parse_tool_event, read_new_session_lines,
+        handle_notification, parse_raw_session_command_event, parse_tool_event,
+        read_new_session_lines,
     };
 
     #[test]
@@ -2266,6 +2273,30 @@ mod tests {
         assert_eq!(new_offset, 11);
 
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn protocol_error_returns_error_without_failed_update() {
+        smol::block_on(async {
+            let (updates_tx, updates_rx) = channel::unbounded();
+            let params = json!({
+                "error": {
+                    "message": "turn exploded"
+                }
+            });
+
+            let error = handle_notification(
+                "error",
+                Some(&params),
+                &HarnessThreadId("thread-1".into()),
+                &updates_tx,
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(error.to_string(), "turn exploded");
+            assert!(updates_rx.try_recv().is_err());
+        });
     }
 
     #[test]
