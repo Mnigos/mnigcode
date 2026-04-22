@@ -781,7 +781,7 @@ async fn handle_notification(
         "turn/started" => {
             send_status(updates, thread_id.clone(), HarnessRunStatus::Running).await;
         }
-        "thread/tokenUsage/updated" => {
+        "turn/completed" | "thread/tokenUsage/updated" => {
             if let Some((tokens_used, model_context_window)) =
                 params.and_then(extract_thread_token_usage)
             {
@@ -1400,9 +1400,13 @@ fn render_command_output_value(value: &Value) -> Option<String> {
 fn extract_thread_token_usage(params: &Value) -> Option<(usize, Option<usize>)> {
     let usage = params
         .get("tokenUsage")
-        .or_else(|| params.get("token_usage"))?;
-    let last = usage.get("last").or_else(|| usage.get("total"))?;
-    let tokens_used = extract_token_usage_breakdown_total(last)?;
+        .or_else(|| params.get("token_usage"))
+        .or_else(|| params.get("usage"))?;
+    let current = usage
+        .get("last")
+        .or_else(|| usage.get("total"))
+        .unwrap_or(usage);
+    let tokens_used = extract_token_usage_breakdown_total(current)?;
     let model_context_window = usage
         .get("modelContextWindow")
         .or_else(|| usage.get("model_context_window"))
@@ -1413,6 +1417,10 @@ fn extract_thread_token_usage(params: &Value) -> Option<(usize, Option<usize>)> 
 }
 
 fn extract_token_usage_breakdown_total(breakdown: &Value) -> Option<usize> {
+    if let Some(total_tokens) = breakdown.as_u64() {
+        return Some(total_tokens as usize);
+    }
+
     if let Some(total_tokens) = breakdown
         .get("totalTokens")
         .or_else(|| breakdown.get("total_tokens"))
@@ -2343,6 +2351,29 @@ mod tests {
     }
 
     #[test]
+    fn extracts_legacy_flat_token_usage() {
+        let params = json!({
+            "usage": {
+                "inputTokens": 700,
+                "outputTokens": 200
+            }
+        });
+
+        assert_eq!(extract_thread_token_usage(&params), Some((900, None)));
+    }
+
+    #[test]
+    fn extracts_numeric_token_usage_total() {
+        let params = json!({
+            "usage": {
+                "total": 900
+            }
+        });
+
+        assert_eq!(extract_thread_token_usage(&params), Some((900, None)));
+    }
+
+    #[test]
     fn native_token_usage_notification_emits_update() {
         smol::block_on(async {
             let (updates_tx, updates_rx) = channel::unbounded();
@@ -2386,6 +2417,40 @@ mod tests {
                     assert_eq!(thread_id, HarnessThreadId("thread-1".into()));
                     assert_eq!(tokens_used, 900);
                     assert_eq!(model_context_window, Some(256_000));
+                }
+                other => panic!("unexpected update: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn turn_completed_usage_notification_emits_update() {
+        smol::block_on(async {
+            let (updates_tx, updates_rx) = channel::unbounded();
+            let params = json!({
+                "usage": {
+                    "totalTokens": 900
+                }
+            });
+
+            handle_notification(
+                "turn/completed",
+                Some(&params),
+                &HarnessThreadId("thread-1".into()),
+                &updates_tx,
+            )
+            .await
+            .unwrap();
+
+            match updates_rx.recv().await.unwrap() {
+                HarnessTurnUpdate::TokenUsage {
+                    thread_id,
+                    tokens_used,
+                    model_context_window,
+                } => {
+                    assert_eq!(thread_id, HarnessThreadId("thread-1".into()));
+                    assert_eq!(tokens_used, 900);
+                    assert_eq!(model_context_window, None);
                 }
                 other => panic!("unexpected update: {other:?}"),
             }
