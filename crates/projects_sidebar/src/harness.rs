@@ -567,6 +567,7 @@ async fn run_codex_app_server_session_impl(
                 path.clone(),
                 start_offset,
                 config.thread_id.clone(),
+                config.executor.clone(),
                 updates.clone(),
                 stop_rx,
             ));
@@ -1418,6 +1419,7 @@ async fn stream_exec_command_outputs_from_session(
     session_path: PathBuf,
     mut offset: u64,
     thread_id: HarnessThreadId,
+    executor: BackgroundExecutor,
     updates: Sender<HarnessTurnUpdate>,
     stop: Receiver<()>,
 ) {
@@ -1477,7 +1479,7 @@ async fn stream_exec_command_outputs_from_session(
             }
         }
 
-        smol::Timer::after(Duration::from_millis(150)).await;
+        executor.timer(Duration::from_millis(150)).await;
     }
 }
 

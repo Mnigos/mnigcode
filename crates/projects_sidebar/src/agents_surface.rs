@@ -1334,13 +1334,6 @@ fn open_agent_link(
     true
 }
 
-fn should_skip_message(message: &TranscriptMessage) -> bool {
-    match &message.role {
-        TranscriptRole::Assistant if message.text.is_empty() => true,
-        _ => false,
-    }
-}
-
 fn format_thinking_duration(duration_ms: u64) -> String {
     if duration_ms < 1000 {
         return "<1s".to_string();
@@ -1492,6 +1485,94 @@ fn latest_turn_file_changes(thread: &HarnessThread) -> Vec<HarnessFileChange> {
     changes
 }
 
+fn is_command_tool_message(message: &TranscriptMessage) -> bool {
+    matches!(
+        message.role,
+        TranscriptRole::Tool {
+            kind: ToolDisplayKind::Command,
+            ..
+        }
+    )
+}
+
+fn command_group_range(
+    messages: &[TranscriptMessage],
+    index: usize,
+) -> Option<std::ops::Range<usize>> {
+    if !is_command_tool_message(messages.get(index)?) {
+        return None;
+    }
+
+    let mut start = index;
+    while start > 0 && is_command_tool_message(&messages[start - 1]) {
+        start -= 1;
+    }
+
+    let mut end = index + 1;
+    while end < messages.len() && is_command_tool_message(&messages[end]) {
+        end += 1;
+    }
+
+    (end - start > 1).then_some(start..end)
+}
+
+fn command_text_from_title(title: &SharedString) -> SharedString {
+    title.split_once(": ")
+        .map(|(_, command)| command.trim().to_string())
+        .unwrap_or_default()
+        .into()
+}
+
+fn command_item_label(title: &SharedString, status: ToolStatus) -> SharedString {
+    let command = command_text_from_title(title);
+    if command.is_empty() {
+        return match status {
+            ToolStatus::Running => "Running command".into(),
+            _ => "Ran command".into(),
+        };
+    }
+
+    match status {
+        ToolStatus::Running => format!("Running {command}").into(),
+        _ => format!("Ran {command}").into(),
+    }
+}
+
+fn command_group_label(messages: &[TranscriptMessage]) -> SharedString {
+    let count = messages.len();
+    if messages.iter().any(|message| {
+        matches!(
+            message.role,
+            TranscriptRole::Tool {
+                status: ToolStatus::Running,
+                ..
+            }
+        )
+    }) {
+        return match count {
+            1 => "Running 1 command".into(),
+            _ => format!("Running {count} commands").into(),
+        };
+    }
+
+    match count {
+        1 => "Ran 1 command".into(),
+        _ => format!("Ran {count} commands").into(),
+    }
+}
+
+fn should_skip_message(
+    index: usize,
+    message: &TranscriptMessage,
+    all: &[TranscriptMessage],
+) -> bool {
+    if matches!(message.role, TranscriptRole::Assistant) && message.text.is_empty() {
+        return true;
+    }
+
+    command_group_range(all, index).is_some_and(|range| index != range.start)
+}
+
 fn should_show_role_header(
     index: usize,
     message: &TranscriptMessage,
@@ -1546,6 +1627,7 @@ struct TranscriptView {
     workspace: WeakEntity<workspace::Workspace>,
     active_thread: Option<Arc<HarnessThread>>,
     expanded_tool_messages: HashSet<(SharedString, usize)>,
+    expanded_command_groups: HashSet<(SharedString, usize)>,
     expanded_file_changes: HashSet<(SharedString, usize, SharedString)>,
     markdown_cache: HashMap<(SharedString, usize), (SharedString, Entity<Markdown>)>,
     user_message_editor_cache: HashMap<(SharedString, usize), (String, Entity<Editor>)>,
@@ -1560,6 +1642,7 @@ impl TranscriptView {
             workspace: workspace.downgrade(),
             active_thread: None,
             expanded_tool_messages: HashSet::default(),
+            expanded_command_groups: HashSet::default(),
             expanded_file_changes: HashSet::default(),
             markdown_cache: HashMap::default(),
             user_message_editor_cache: HashMap::default(),
@@ -1582,6 +1665,7 @@ impl TranscriptView {
 
         if previous_thread_id != next_thread_id {
             self.expanded_tool_messages.clear();
+            self.expanded_command_groups.clear();
             self.expanded_file_changes.clear();
             self.markdown_cache.clear();
             self.user_message_editor_cache.clear();
@@ -1639,6 +1723,19 @@ impl TranscriptView {
         let key = (thread_id, index);
         if !self.expanded_tool_messages.remove(&key) {
             self.expanded_tool_messages.insert(key);
+        }
+        cx.notify();
+    }
+
+    fn toggle_command_group_expansion(
+        &mut self,
+        thread_id: SharedString,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (thread_id, index);
+        if !self.expanded_command_groups.remove(&key) {
+            self.expanded_command_groups.insert(key);
         }
         cx.notify();
     }
@@ -1711,7 +1808,7 @@ impl TranscriptView {
                 return div().into_any_element();
             };
 
-            if should_skip_message(message) {
+            if should_skip_message(index, message, &thread.messages) {
                 return div().into_any_element();
             }
 
@@ -1742,6 +1839,13 @@ impl TranscriptView {
             ..
         } = &message.role
         {
+            if *kind == ToolDisplayKind::Command
+                && let Some(thread) = self.active_thread.as_ref()
+                && let Some(range) = command_group_range(&thread.messages, index)
+            {
+                return self.render_command_group_message(thread_id, range, window, cx);
+            }
+
             return self.render_tool_message(
                 thread_id,
                 index,
@@ -2163,6 +2267,171 @@ impl TranscriptView {
             )
             .child(self.render_file_changes(thread_id, index, file_changes, false, true, cx))
             .into_any_element()
+    }
+
+    fn render_command_group_message(
+        &mut self,
+        thread_id: SharedString,
+        range: std::ops::Range<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(messages) = self
+            .active_thread
+            .as_ref()
+            .map(|thread| thread.messages[range.clone()].to_vec())
+        else {
+            return div().into_any_element();
+        };
+        let key = (thread_id.clone(), range.start);
+        let expanded = self.expanded_command_groups.contains(&key);
+        let chevron = if expanded {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        };
+        let has_running = messages.iter().any(|message| {
+            matches!(
+                message.role,
+                TranscriptRole::Tool {
+                    status: ToolStatus::Running,
+                    ..
+                }
+            )
+        });
+
+        let (header_thread_id, header_index) = key;
+        let mut column = v_flex()
+            .id(("command-group-row", range.start))
+            .w_full()
+            .gap_1()
+            .child(
+                h_flex()
+                    .id(("command-group-header", range.start))
+                    .w_full()
+                    .gap_1p5()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_command_group_expansion(
+                            header_thread_id.clone(),
+                            header_index,
+                            cx,
+                        );
+                    }))
+                    .child(
+                        Icon::new(chevron)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Icon::new(IconName::Terminal)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(command_group_label(&messages))
+                            .size(LabelSize::Small)
+                            .color(Color::Default),
+                    )
+                    .when(has_running, |this| {
+                        this.child(
+                            Icon::new(IconName::LoadCircle)
+                                .size(IconSize::XSmall)
+                                .color(Color::Accent)
+                                .with_rotate_animation(2),
+                        )
+                    }),
+            );
+
+        if expanded {
+            for (offset, message) in messages.iter().enumerate() {
+                let index = range.start + offset;
+                let TranscriptRole::Tool {
+                    title, status, ..
+                } = &message.role
+                else {
+                    continue;
+                };
+                column = column.child(self.render_command_group_item(
+                    thread_id.clone(),
+                    index,
+                    title,
+                    *status,
+                    &message.text,
+                    window,
+                    cx,
+                ));
+            }
+        }
+
+        column.into_any_element()
+    }
+
+    fn render_command_group_item(
+        &mut self,
+        thread_id: SharedString,
+        index: usize,
+        title: &SharedString,
+        status: ToolStatus,
+        body: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = (thread_id, index);
+        let expanded = self.expanded_tool_messages.contains(&key);
+        let chevron = if expanded {
+            IconName::ChevronDown
+        } else {
+            IconName::ChevronRight
+        };
+        let (header_thread_id, header_index) = key;
+        let mut item = v_flex()
+            .w_full()
+            .gap_1()
+            .ml(px(20.0))
+            .child(
+                h_flex()
+                    .id(("command-group-item-header", index))
+                    .w_full()
+                    .gap_1p5()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_tool_expansion(header_thread_id.clone(), header_index, cx);
+                    }))
+                    .child(
+                        Icon::new(chevron)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(command_item_label(title, status))
+                            .size(LabelSize::Small)
+                            .color(Color::Default)
+                            .truncate(),
+                    )
+                    .when(status == ToolStatus::Running, |this| {
+                        this.child(
+                            Icon::new(IconName::LoadCircle)
+                                .size(IconSize::XSmall)
+                                .color(Color::Accent)
+                                .with_rotate_animation(2),
+                        )
+                    }),
+            );
+
+        if expanded {
+            item = item.child(self.render_command_body(title, body, status, cx));
+        }
+
+        item.into_any_element()
     }
 
     fn render_file_changes(
