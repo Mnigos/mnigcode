@@ -1,16 +1,23 @@
 use anyhow::{Context as _, Result, anyhow, bail};
+use base64::Engine as _;
 use futures::{
     AsyncBufReadExt as _, AsyncRead, AsyncWrite, AsyncWriteExt as _,
     io::{BufReader, BufWriter},
 };
-use gpui::SharedString;
+use gpui::{BackgroundExecutor, SharedString};
 use serde_json::{Value, json};
 use smol::{
-    Timer,
     channel::{Receiver, Sender},
     process::Command,
 };
-use std::{future::Future, path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    io::{Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+    process::Stdio,
+    time::Duration,
+};
 
 const APP_SERVER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -71,11 +78,12 @@ impl HarnessSandboxPolicy {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HarnessSessionConfig {
     pub thread_id: HarnessThreadId,
     pub provider_thread_id: Option<String>,
     pub cwd: PathBuf,
+    pub executor: BackgroundExecutor,
     pub model: String,
     pub approval_policy: HarnessApprovalPolicy,
     pub sandbox_policy: HarnessSandboxPolicy,
@@ -105,6 +113,14 @@ pub struct HarnessSkillDefinition {
     pub source: HarnessSkillSource,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HarnessFileChange {
+    pub(crate) path: SharedString,
+    pub(crate) added_lines: usize,
+    pub(crate) removed_lines: usize,
+    pub(crate) unified_diff: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum HarnessSkillSource {
     Local,
@@ -131,6 +147,7 @@ pub enum HarnessTurnUpdate {
         phase: HarnessToolPhase,
         title: SharedString,
         detail: SharedString,
+        file_changes: Vec<HarnessFileChange>,
     },
     TokensUsed {
         thread_id: HarnessThreadId,
@@ -181,7 +198,10 @@ pub async fn run_codex_app_server_session(
     }
 }
 
-pub async fn load_codex_available_skills(cwd: PathBuf) -> Result<Vec<HarnessSkillDefinition>> {
+pub async fn load_codex_available_skills(
+    cwd: PathBuf,
+    executor: BackgroundExecutor,
+) -> Result<Vec<HarnessSkillDefinition>> {
     let mut command = Command::new("codex");
     command
         .arg("app-server")
@@ -234,6 +254,7 @@ pub async fn load_codex_available_skills(cwd: PathBuf) -> Result<Vec<HarnessSkil
     .await?;
     await_app_server_response(
         &mut child,
+        &executor,
         "initialize response",
         read_until_app_server_response(&mut reader, &mut writer, initialize_id),
     )
@@ -263,6 +284,7 @@ pub async fn load_codex_available_skills(cwd: PathBuf) -> Result<Vec<HarnessSkil
     .await?;
     let skills_result = await_app_server_response(
         &mut child,
+        &executor,
         "skills/list response",
         read_until_app_server_response(&mut reader, &mut writer, skills_id),
     )
@@ -309,6 +331,7 @@ where
 
 async fn await_app_server_response<Fut, T>(
     child: &mut smol::process::Child,
+    executor: &BackgroundExecutor,
     description: &'static str,
     future: Fut,
 ) -> Result<T>
@@ -316,7 +339,7 @@ where
     Fut: Future<Output = Result<T>>,
 {
     match smol::future::or(future, async {
-        Timer::after(APP_SERVER_RESPONSE_TIMEOUT).await;
+        executor.timer(APP_SERVER_RESPONSE_TIMEOUT).await;
         Err(anyhow!(
             "timed out waiting for codex app-server {description} after {:?}",
             APP_SERVER_RESPONSE_TIMEOUT
@@ -403,6 +426,7 @@ async fn run_codex_app_server_session_impl(
     .await?;
     await_app_server_response(
         &mut child,
+        &config.executor,
         "initialize response",
         read_until_response(
             &mut reader,
@@ -454,6 +478,7 @@ async fn run_codex_app_server_session_impl(
     write_message(&mut writer, thread_open_message).await?;
     let thread_open_result = await_app_server_response(
         &mut child,
+        &config.executor,
         "thread open response",
         read_until_response(
             &mut reader,
@@ -467,6 +492,7 @@ async fn run_codex_app_server_session_impl(
     let provider_thread_id = read_thread_id(&thread_open_result)
         .or(config.provider_thread_id.clone())
         .context("codex app-server did not return a thread id")?;
+    let raw_session_path = read_thread_path(&thread_open_result);
 
     send_update(
         updates,
@@ -519,6 +545,7 @@ async fn run_codex_app_server_session_impl(
         .await?;
         await_app_server_response(
             &mut child,
+            &config.executor,
             "turn/start response",
             read_until_response(
                 &mut reader,
@@ -531,7 +558,27 @@ async fn run_codex_app_server_session_impl(
         .await?;
         send_status(updates, config.thread_id.clone(), HarnessRunStatus::Running).await;
 
+        let raw_session_stream = raw_session_path.as_ref().map(|path| {
+            let start_offset = std::fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            let (stop_tx, stop_rx) = smol::channel::bounded(1);
+            let task = smol::spawn(stream_exec_command_outputs_from_session(
+                path.clone(),
+                start_offset,
+                config.thread_id.clone(),
+                updates.clone(),
+                stop_rx,
+            ));
+            (stop_tx, task)
+        });
+
         read_until_turn_finished(&mut reader, &mut writer, &config.thread_id, updates).await?;
+
+        if let Some((stop, task)) = raw_session_stream {
+            stop.send(()).await.ok();
+            task.await;
+        }
     }
 
     child.kill().ok();
@@ -757,6 +804,7 @@ async fn handle_notification(
                         phase: event.phase,
                         title: event.title,
                         detail: event.detail,
+                        file_changes: event.file_changes,
                     },
                 )
                 .await;
@@ -797,6 +845,7 @@ async fn handle_notification(
                     phase,
                     title: "Reasoning".into(),
                     detail,
+                    file_changes: Vec::new(),
                 },
             )
             .await;
@@ -813,6 +862,7 @@ struct ParsedToolEvent {
     phase: HarnessToolPhase,
     title: SharedString,
     detail: SharedString,
+    file_changes: Vec<HarnessFileChange>,
 }
 
 fn parse_tool_event(method: &str, params: Option<&Value>) -> Option<ParsedToolEvent> {
@@ -870,6 +920,7 @@ fn parse_tool_event(method: &str, params: Option<&Value>) -> Option<ParsedToolEv
     let item_id = extract_item_id(params);
     let detail = extract_tool_detail(&kind, phase_str, params);
     let title = tool_title(&kind, phase, params);
+    let file_changes = extract_file_changes(&kind, params);
 
     Some(ParsedToolEvent {
         item_id,
@@ -877,6 +928,7 @@ fn parse_tool_event(method: &str, params: Option<&Value>) -> Option<ParsedToolEv
         phase,
         title,
         detail,
+        file_changes,
     })
 }
 
@@ -978,11 +1030,7 @@ fn extract_tool_detail(
     if matches!(kind, HarnessToolKind::Command) {
         let command_text = command_string(params, item_payload);
 
-        if let Some(snapshot) = lookup("aggregated_output")
-            .or_else(|| lookup("aggregatedOutput"))
-            .or_else(|| lookup("output"))
-            .or_else(|| lookup("stdout"))
-        {
+        if let Some(snapshot) = command_output_snapshot(params, item_payload) {
             // Some servers echo the command itself back in `output`. Strip it
             // so the transcript doesn't render the command line twice.
             if let Some(command_text) = command_text.as_deref()
@@ -992,7 +1040,7 @@ fn extract_tool_detail(
             }
             return snapshot.into();
         }
-        if let Some(delta) = lookup("delta") {
+        if let Some(delta) = command_output_delta(params, item_payload).or_else(|| lookup("delta")) {
             return delta.into();
         }
         // Nothing useful on a pure "completed" event with no output field.
@@ -1040,6 +1088,140 @@ fn extract_tool_detail(
     SharedString::default()
 }
 
+fn extract_file_changes(
+    kind: &HarnessToolKind,
+    params: Option<&Value>,
+) -> Vec<HarnessFileChange> {
+    if !matches!(kind, HarnessToolKind::FileChange) {
+        return Vec::new();
+    }
+    let Some(params) = params else {
+        return Vec::new();
+    };
+    let item_payload = params.get("item");
+
+    let changes = ["changes", "fileChanges", "file_changes"]
+        .iter()
+        .find_map(|key| {
+            params
+                .get(*key)
+                .or_else(|| item_payload.and_then(|item| item.get(*key)))
+        });
+
+    let mut file_changes = match changes {
+        Some(Value::Object(map)) => map
+            .iter()
+            .filter_map(|(path, value)| file_change_from_value(Some(path.as_str()), value))
+            .collect::<Vec<_>>(),
+        Some(Value::Array(array)) => array
+            .iter()
+            .filter_map(|value| file_change_from_value(None, value))
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
+
+    if file_changes.is_empty()
+        && let Some(change) = file_change_from_value(None, params)
+            .or_else(|| item_payload.and_then(|item| file_change_from_value(None, item)))
+    {
+        file_changes.push(change);
+    }
+
+    file_changes
+}
+
+fn file_change_from_value(path_hint: Option<&str>, value: &Value) -> Option<HarnessFileChange> {
+    let object = value.as_object();
+    let lookup_string = |keys: &[&str]| -> Option<String> {
+        keys.iter()
+            .find_map(|key| object.and_then(|object| object.get(*key)).and_then(Value::as_str))
+            .map(str::to_string)
+    };
+    let lookup_usize = |keys: &[&str]| -> Option<usize> {
+        keys.iter()
+            .find_map(|key| object.and_then(|object| object.get(*key)).and_then(Value::as_u64))
+            .map(|value| value as usize)
+    };
+
+    let path = path_hint
+        .map(str::to_string)
+        .or_else(|| {
+            lookup_string(&["path", "filePath", "file", "relativePath", "absolutePath"])
+        })?;
+    let unified_diff = lookup_string(&["unified_diff", "unifiedDiff", "diff", "patch"])
+        .or_else(|| {
+            let old_text = lookup_string(&["old_text", "oldText", "before"]);
+            let new_text = lookup_string(&["new_text", "newText", "after"]);
+            match (old_text, new_text) {
+                (Some(old_text), Some(new_text)) if old_text != new_text => {
+                    Some(fallback_unified_diff(&old_text, &new_text))
+                }
+                _ => None,
+            }
+        });
+
+    let (diff_added, diff_removed) = unified_diff
+        .as_deref()
+        .map(count_unified_diff_lines)
+        .unwrap_or_default();
+    let added_lines = lookup_usize(&[
+        "added_lines",
+        "addedLines",
+        "additions",
+        "linesAdded",
+        "insertions",
+    ])
+    .unwrap_or(diff_added);
+    let removed_lines = lookup_usize(&[
+        "removed_lines",
+        "removedLines",
+        "deletions",
+        "linesRemoved",
+        "deletedLines",
+    ])
+    .unwrap_or(diff_removed);
+
+    Some(HarnessFileChange {
+        path: path.into(),
+        added_lines,
+        removed_lines,
+        unified_diff,
+    })
+}
+
+fn count_unified_diff_lines(diff: &str) -> (usize, usize) {
+    let mut added = 0;
+    let mut removed = 0;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
+fn fallback_unified_diff(old_text: &str, new_text: &str) -> String {
+    let old_line_count = old_text.lines().count().max(1);
+    let new_line_count = new_text.lines().count().max(1);
+    let mut diff = format!("@@ -1,{old_line_count} +1,{new_line_count} @@\n");
+    for line in old_text.lines() {
+        diff.push('-');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    for line in new_text.lines() {
+        diff.push('+');
+        diff.push_str(line);
+        diff.push('\n');
+    }
+    diff
+}
+
 fn command_string(params: &Value, item_payload: Option<&Value>) -> Option<String> {
     // String form: { "command": "ls -la" }
     if let Some(cmd) = params.get("command").and_then(Value::as_str).or_else(|| {
@@ -1075,6 +1257,125 @@ fn command_string(params: &Value, item_payload: Option<&Value>) -> Option<String
     None
 }
 
+fn command_output_snapshot(params: &Value, item_payload: Option<&Value>) -> Option<String> {
+    for key in ["aggregated_output", "aggregatedOutput", "output"] {
+        if let Some(value) = params.get(key).or_else(|| item_payload.and_then(|item| item.get(key)))
+            && let Some(rendered) = render_command_output_value(value)
+        {
+            return Some(rendered);
+        }
+    }
+
+    if let Some(value) = params
+        .get("result")
+        .or_else(|| item_payload.and_then(|item| item.get("result")))
+        .and_then(render_command_output_value)
+    {
+        return Some(value);
+    }
+
+    let stdout = params
+        .get("stdout")
+        .or_else(|| item_payload.and_then(|item| item.get("stdout")))
+        .and_then(render_command_output_value);
+    let stderr = params
+        .get("stderr")
+        .or_else(|| item_payload.and_then(|item| item.get("stderr")))
+        .and_then(render_command_output_value);
+
+    match (stdout, stderr) {
+        (Some(stdout), Some(stderr)) if stdout != stderr => Some(format!("{stdout}\n{stderr}")),
+        (Some(stdout), _) => Some(stdout),
+        (_, Some(stderr)) => Some(stderr),
+        _ => None,
+    }
+}
+
+fn command_output_delta(params: &Value, item_payload: Option<&Value>) -> Option<String> {
+    for key in ["delta", "text"] {
+        if let Some(value) = params.get(key).or_else(|| item_payload.and_then(|item| item.get(key)))
+            && let Some(rendered) = render_command_output_value(value)
+        {
+            return Some(rendered);
+        }
+    }
+
+    let delta_base64 = params
+        .get("deltaBase64")
+        .or_else(|| params.get("delta_base64"))
+        .or_else(|| item_payload.and_then(|item| item.get("deltaBase64")))
+        .or_else(|| item_payload.and_then(|item| item.get("delta_base64")))
+        .and_then(Value::as_str)?;
+
+    base64::engine::general_purpose::STANDARD
+        .decode(delta_base64)
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .filter(|text| !text.is_empty())
+}
+
+fn render_command_output_value(value: &Value) -> Option<String> {
+    fn collect(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::Null => {}
+            Value::String(text) if !text.is_empty() => out.push(text.clone()),
+            Value::Array(values) => {
+                for value in values {
+                    collect(value, out);
+                }
+            }
+            Value::Object(map) => {
+                if let Some(delta_base64) = map
+                    .get("deltaBase64")
+                    .or_else(|| map.get("delta_base64"))
+                    .and_then(Value::as_str)
+                    && let Ok(bytes) =
+                        base64::engine::general_purpose::STANDARD.decode(delta_base64)
+                {
+                    let text = String::from_utf8_lossy(&bytes).into_owned();
+                    if !text.is_empty() {
+                        out.push(text);
+                    }
+                }
+
+                for key in [
+                    "result",
+                    "aggregated_output",
+                    "aggregatedOutput",
+                    "output",
+                    "stdout",
+                    "stderr",
+                    "text",
+                    "delta",
+                    "content",
+                    "message",
+                ] {
+                    if let Some(value) = map.get(key) {
+                        collect(value, out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut output = Vec::new();
+    collect(value, &mut output);
+
+    let mut deduped = Vec::new();
+    for piece in output {
+        if deduped.last().map(String::as_str) != Some(piece.as_str()) {
+            deduped.push(piece);
+        }
+    }
+
+    if deduped.is_empty() {
+        None
+    } else {
+        Some(deduped.join("\n"))
+    }
+}
+
 fn extract_total_tokens(params: &Value) -> Option<usize> {
     let usage = params
         .get("usage")
@@ -1106,6 +1407,175 @@ fn extract_total_tokens(params: &Value) -> Option<usize> {
 
     let sum = input + output;
     if sum > 0 { Some(sum as usize) } else { None }
+}
+
+enum RawSessionCommandEvent {
+    Started { call_id: String, tool_name: String },
+    Completed { call_id: String, output: String },
+}
+
+async fn stream_exec_command_outputs_from_session(
+    session_path: PathBuf,
+    mut offset: u64,
+    thread_id: HarnessThreadId,
+    updates: Sender<HarnessTurnUpdate>,
+    stop: Receiver<()>,
+) {
+    let mut pending_tool_names = HashMap::new();
+    let mut partial = Vec::new();
+
+    loop {
+        if stop.try_recv().is_ok() {
+            break;
+        }
+
+        match read_new_session_lines(&session_path, offset) {
+            Ok(Some((new_offset, bytes))) => {
+                offset = new_offset;
+                partial.extend_from_slice(&bytes);
+
+                while let Some(newline_index) = partial.iter().position(|byte| *byte == b'\n') {
+                    let line = partial.drain(..=newline_index).collect::<Vec<_>>();
+                    let line = &line[..line.len().saturating_sub(1)];
+                    if line.is_empty() {
+                        continue;
+                    }
+
+                    match parse_raw_session_command_event(line) {
+                        Some(RawSessionCommandEvent::Started { call_id, tool_name }) => {
+                            pending_tool_names.insert(call_id, tool_name);
+                        }
+                        Some(RawSessionCommandEvent::Completed { call_id, output }) => {
+                            if pending_tool_names.get(&call_id).map(String::as_str)
+                                == Some("exec_command")
+                            {
+                                send_update(
+                                    &updates,
+                                    HarnessTurnUpdate::ToolEvent {
+                                        thread_id: thread_id.clone(),
+                                        item_id: Some(call_id),
+                                        kind: HarnessToolKind::Command,
+                                        phase: HarnessToolPhase::Update,
+                                        title: SharedString::default(),
+                                        detail: output.into(),
+                                        file_changes: Vec::new(),
+                                    },
+                                )
+                                .await;
+                            }
+                        }
+                        None => {}
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                log::debug!(
+                    "failed to read raw codex session output from {}: {error}",
+                    session_path.display()
+                );
+            }
+        }
+
+        smol::Timer::after(Duration::from_millis(150)).await;
+    }
+}
+
+fn read_new_session_lines(path: &Path, offset: u64) -> Result<Option<(u64, Vec<u8>)>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+
+    let file_len = file.metadata()?.len();
+    if file_len <= offset {
+        return Ok(None);
+    }
+
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some((file_len, bytes)))
+}
+
+fn parse_raw_session_command_event(line: &[u8]) -> Option<RawSessionCommandEvent> {
+    let value: Value = serde_json::from_slice(line).ok()?;
+    let kind = value.get("type").and_then(Value::as_str)?;
+    let payload = value.get("payload")?;
+
+    match kind {
+        "response_item"
+            if payload.get("type").and_then(Value::as_str) == Some("function_call") =>
+        {
+            Some(RawSessionCommandEvent::Started {
+                call_id: payload.get("call_id").and_then(Value::as_str)?.to_string(),
+                tool_name: payload.get("name").and_then(Value::as_str)?.to_string(),
+            })
+        }
+        "response_item"
+            if payload.get("type").and_then(Value::as_str) == Some("function_call_output") =>
+        {
+            Some(RawSessionCommandEvent::Completed {
+                call_id: payload.get("call_id").and_then(Value::as_str)?.to_string(),
+                output: extract_exec_command_output(
+                    payload.get("output").and_then(Value::as_str)?,
+                )?,
+            })
+        }
+        "event_msg" if payload.get("type").and_then(Value::as_str) == Some("exec_command_end") => {
+            let output = payload
+                .get("formatted_output")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    payload
+                        .get("aggregated_output")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(str::to_string)
+                })
+                .or_else(|| {
+                    let stdout = payload
+                        .get("stdout")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty());
+                    let stderr = payload
+                        .get("stderr")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty());
+                    match (stdout, stderr) {
+                        (Some(stdout), Some(stderr)) if stdout != stderr => {
+                            Some(format!("{stdout}\n{stderr}"))
+                        }
+                        (Some(stdout), _) => Some(stdout.to_string()),
+                        (_, Some(stderr)) => Some(stderr.to_string()),
+                        _ => None,
+                    }
+                })?;
+
+            Some(RawSessionCommandEvent::Completed {
+                call_id: payload.get("call_id").and_then(Value::as_str)?.to_string(),
+                output,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn extract_exec_command_output(output: &str) -> Option<String> {
+    let output = if let Some(index) = output.find("\nOutput:\n") {
+        &output[index + "\nOutput:\n".len()..]
+    } else {
+        output
+    };
+    let output = output.trim_matches('\n');
+    if output.is_empty() {
+        None
+    } else {
+        Some(output.to_string())
+    }
 }
 
 fn reasoning_text(params: &Value, item_payload: Option<&Value>) -> Option<String> {
@@ -1429,7 +1899,10 @@ fn tool_title(
 mod tests {
     use serde_json::json;
 
-    use super::{HarnessToolKind, parse_tool_event};
+    use super::{
+        HarnessToolKind, RawSessionCommandEvent, extract_exec_command_output,
+        parse_raw_session_command_event, parse_tool_event,
+    };
 
     #[test]
     fn formats_mcp_tool_arguments_as_fields() {
@@ -1539,6 +2012,131 @@ mod tests {
         assert_eq!(event.phase, super::HarnessToolPhase::Failed);
         assert_eq!(event.title.as_ref(), "Run command: /bin/zsh -lc exit 1");
         assert_eq!(event.detail.as_ref(), "failed");
+    }
+
+    #[test]
+    fn decodes_command_output_delta_base64() {
+        let params = json!({
+            "itemId": "cmd-4",
+            "deltaBase64": "aGVsbG8K"
+        });
+
+        let event = parse_tool_event("item/commandExecution/outputDelta", Some(&params)).unwrap();
+
+        assert_eq!(event.kind, HarnessToolKind::Command);
+        assert_eq!(event.phase, super::HarnessToolPhase::Update);
+        assert_eq!(event.detail.as_ref(), "hello\n");
+    }
+
+    #[test]
+    fn renders_command_stdout_and_stderr_snapshots() {
+        let params = json!({
+            "item": {
+                "id": "cmd-5",
+                "type": "commandExecution",
+                "status": "completed",
+                "command": ["/bin/zsh", "-lc", "echo hi >&2"],
+                "stdout": "stdout line",
+                "stderr": "stderr line"
+            }
+        });
+
+        let event = parse_tool_event("item/completed", Some(&params)).unwrap();
+
+        assert_eq!(event.kind, HarnessToolKind::Command);
+        assert_eq!(event.phase, super::HarnessToolPhase::End);
+        assert_eq!(event.detail.as_ref(), "stdout line\nstderr line");
+    }
+
+    #[test]
+    fn renders_command_output_from_nested_result_snapshot() {
+        let params = json!({
+            "item": {
+                "id": "cmd-6",
+                "type": "commandExecution",
+                "status": "completed",
+                "command": ["/bin/zsh", "-lc", "python3 - <<'PY'"],
+                "result": {
+                    "stdout": "Cost: $0.27732585\nDuration: 155780 ms",
+                    "stderr": ""
+                }
+            }
+        });
+
+        let event = parse_tool_event("item/completed", Some(&params)).unwrap();
+
+        assert_eq!(event.kind, HarnessToolKind::Command);
+        assert_eq!(event.phase, super::HarnessToolPhase::End);
+        assert_eq!(event.detail.as_ref(), "Cost: $0.27732585\nDuration: 155780 ms");
+    }
+
+    #[test]
+    fn extracts_file_change_summaries_from_changes_map() {
+        let params = json!({
+            "item": {
+                "id": "edit-1",
+                "type": "fileChange",
+                "changes": {
+                    "src/main.rs": {
+                        "type": "update",
+                        "unified_diff": "@@ -1,2 +1,2 @@\n fn main() {\n-    old();\n+    new();\n }\n"
+                    }
+                }
+            }
+        });
+
+        let event = parse_tool_event("item/completed", Some(&params)).unwrap();
+
+        assert_eq!(event.kind, HarnessToolKind::FileChange);
+        assert_eq!(event.file_changes.len(), 1);
+        assert_eq!(event.file_changes[0].path.as_ref(), "src/main.rs");
+        assert_eq!(event.file_changes[0].added_lines, 1);
+        assert_eq!(event.file_changes[0].removed_lines, 1);
+    }
+
+    #[test]
+    fn parses_exec_command_output_from_raw_session_response_item() {
+        let line = br#"{"timestamp":"2026-04-21T20:00:55.004Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_123","output":"Chunk ID: 2ba670\nWall time: 1.0019 seconds\nProcess running with session ID 6888\nOriginal token count: 2177\nOutput:\nhello\nworld\n"}}"#;
+
+        let event = parse_raw_session_command_event(line).unwrap();
+
+        match event {
+            RawSessionCommandEvent::Completed { call_id, output } => {
+                assert_eq!(call_id, "call_123");
+                assert_eq!(output, "hello\nworld");
+            }
+            RawSessionCommandEvent::Started { .. } => panic!("expected completed event"),
+        }
+    }
+
+    #[test]
+    fn parses_exec_command_end_output_from_raw_session_event() {
+        let line = br#"{"timestamp":"2026-04-21T20:06:06.945Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_456","aggregated_output":"hello\nworld\n","formatted_output":"","stdout":"","stderr":"","status":"completed"}}"#;
+
+        let event = parse_raw_session_command_event(line).unwrap();
+
+        match event {
+            RawSessionCommandEvent::Completed { call_id, output } => {
+                assert_eq!(call_id, "call_456");
+                assert_eq!(output, "hello\nworld\n");
+            }
+            RawSessionCommandEvent::Started { .. } => panic!("expected completed event"),
+        }
+    }
+
+    #[test]
+    fn strips_exec_command_wrapper_text() {
+        assert_eq!(
+            extract_exec_command_output(
+                "Chunk ID: abc\nWall time: 0.001s\nOutput:\nhello\nworld\n"
+            )
+            .as_deref(),
+            Some("hello\nworld")
+        );
+        assert_eq!(
+            extract_exec_command_output("Chunk ID: abc\nWall time: 0.001s\nOutput:\n"),
+            None
+        );
     }
 }
 
@@ -1692,6 +2290,14 @@ fn read_thread_id(result: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .or_else(|| result.get("threadId").and_then(Value::as_str))
         .map(str::to_string)
+}
+
+fn read_thread_path(result: &Value) -> Option<PathBuf> {
+    result
+        .get("thread")
+        .and_then(|thread| thread.get("path"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
 }
 
 fn approval_policy_name(policy: &HarnessApprovalPolicy) -> &'static str {

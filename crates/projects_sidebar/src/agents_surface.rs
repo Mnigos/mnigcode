@@ -21,7 +21,7 @@ use smol::channel;
 use std::{
     collections::{HashMap, HashSet},
     ops::Range,
-    path::PathBuf,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::Arc,
     sync::atomic::AtomicBool,
@@ -37,7 +37,7 @@ use workspace::{MultiWorkspace, MultiWorkspaceEvent, NewThread, ToggleWorkspaceM
 
 use crate::COMPOSER_KEY_CONTEXT;
 use crate::harness::{
-    HarnessApprovalPolicy, HarnessKind, HarnessRunStatus, HarnessSandboxPolicy,
+    HarnessApprovalPolicy, HarnessFileChange, HarnessKind, HarnessRunStatus, HarnessSandboxPolicy,
     HarnessSessionConfig, HarnessSkillDefinition as SkillDefinition, HarnessSkillMention,
     HarnessThreadId, HarnessToolPhase, HarnessTurnInput, HarnessTurnUpdate,
     load_codex_available_skills, run_codex_app_server_session,
@@ -48,8 +48,8 @@ use crate::helpers::{
     workspace_display_name, workspace_root_path, workspace_storage_key,
 };
 use crate::serialization::{
-    SerializedHarnessThread, SerializedThreadGroup, SerializedToolKind, SerializedToolStatus,
-    SerializedTranscriptMessage, SerializedTranscriptRole,
+    SerializedFileChange, SerializedHarnessThread, SerializedThreadGroup, SerializedToolKind,
+    SerializedToolStatus, SerializedTranscriptMessage, SerializedTranscriptRole,
 };
 use crate::transcript::{
     HarnessThread, HarnessThreadSummary, ResolvedFileMention, ToolDisplayKind, ToolStatus,
@@ -420,7 +420,7 @@ impl ComposerFileCompletionProvider {
                             content_len,
                             label,
                             tooltip,
-                            editor.clone(),
+                            editor,
                             window,
                             cx,
                         ) {
@@ -498,18 +498,18 @@ impl ComposerFileCompletionProvider {
         editor: WeakEntity<Editor>,
         cx: &mut App,
     ) -> Completion {
-        let display_path = mention_display_path(workspace, &file_match.path_match, cx);
-        let mention_label: SharedString = file_match
-            .path_match
+        let path_match = file_match.path_match;
+        let display_path = mention_display_path(workspace, &path_match, cx);
+        let mention_label: SharedString = path_match
             .path
             .file_name()
-            .unwrap_or(file_match.path_match.path.as_unix_str())
+            .unwrap_or(path_match.path.as_unix_str())
             .to_string()
             .into();
         let tooltip: SharedString = display_path.clone().into();
         let project_path = project::ProjectPath {
-            worktree_id: project::WorktreeId::from_usize(file_match.path_match.worktree_id),
-            path: file_match.path_match.path.clone(),
+            worktree_id: project::WorktreeId::from_usize(path_match.worktree_id),
+            path: path_match.path,
         };
         let abs_path = workspace
             .read(cx)
@@ -1365,9 +1365,13 @@ fn tool_status_after_phase(status: ToolStatus, phase: HarnessToolPhase) -> ToolS
     }
 }
 
-fn complete_running_commands(thread: &mut HarnessThread) {
+fn complete_running_commands(
+    thread: &mut HarnessThread,
+    except_item_id: Option<&str>,
+) {
     for message in &mut thread.messages {
         let TranscriptRole::Tool {
+            item_id,
             kind: ToolDisplayKind::Command,
             status,
             ..
@@ -1375,6 +1379,10 @@ fn complete_running_commands(thread: &mut HarnessThread) {
         else {
             continue;
         };
+
+        if except_item_id.is_some() && item_id.as_deref() == except_item_id {
+            continue;
+        }
 
         if *status != ToolStatus::Running {
             continue;
@@ -1388,6 +1396,100 @@ fn complete_running_commands(thread: &mut HarnessThread) {
                 Some(started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
         }
     }
+}
+
+fn format_file_change_count(count: usize) -> String {
+    match count {
+        1 => "Edited 1 file".to_string(),
+        _ => format!("Edited {count} files"),
+    }
+}
+
+fn total_added_lines(file_changes: &[HarnessFileChange]) -> usize {
+    file_changes.iter().map(|change| change.added_lines).sum()
+}
+
+fn total_removed_lines(file_changes: &[HarnessFileChange]) -> usize {
+    file_changes.iter().map(|change| change.removed_lines).sum()
+}
+
+fn normalized_file_change_path(path: &str) -> &Path {
+    Path::new(path.strip_prefix("file://").unwrap_or(path).trim_start_matches("./"))
+}
+
+fn render_diff_line(line: &str, cx: &mut Context<TranscriptView>) -> AnyElement {
+    let text = if line.is_empty() { " " } else { line };
+    let colors = cx.theme().colors();
+    let (text_color, background) = if line.starts_with('+') && !line.starts_with("+++") {
+        (
+            Color::Success.color(cx),
+            Color::Success.color(cx).opacity(0.12),
+        )
+    } else if line.starts_with('-') && !line.starts_with("---") {
+        (
+            Color::Error.color(cx),
+            Color::Error.color(cx).opacity(0.12),
+        )
+    } else if line.starts_with("@@") {
+        (Color::Accent.color(cx), colors.element_background)
+    } else {
+        (Color::Muted.color(cx), colors.editor_background)
+    };
+
+    div()
+        .w_full()
+        .px_3()
+        .py_0p5()
+        .bg(background)
+        .text_xs()
+        .font_buffer(cx)
+        .text_color(text_color)
+        .child(SharedString::from(text.to_string()))
+        .into_any_element()
+}
+
+fn merge_file_changes(existing: &mut Vec<HarnessFileChange>, incoming: Vec<HarnessFileChange>) {
+    for incoming_change in incoming {
+        if let Some(existing_change) = existing
+            .iter_mut()
+            .find(|change| change.path == incoming_change.path)
+        {
+            existing_change.added_lines += incoming_change.added_lines;
+            existing_change.removed_lines += incoming_change.removed_lines;
+            if let Some(diff) = incoming_change.unified_diff {
+                match &mut existing_change.unified_diff {
+                    Some(existing_diff) if !existing_diff.is_empty() => {
+                        existing_diff.push('\n');
+                        existing_diff.push_str(&diff);
+                    }
+                    existing_diff => *existing_diff = Some(diff),
+                }
+            }
+        } else {
+            existing.push(incoming_change);
+        }
+    }
+}
+
+fn latest_turn_file_changes(thread: &HarnessThread) -> Vec<HarnessFileChange> {
+    let mut changes = Vec::new();
+    let start_index = thread
+        .messages
+        .iter()
+        .rposition(|message| matches!(message.role, TranscriptRole::User))
+        .map(|index| index + 1)
+        .unwrap_or(0);
+
+    for message in &thread.messages[start_index..] {
+        if let TranscriptRole::Tool {
+            kind: ToolDisplayKind::FileChange,
+            ..
+        } = &message.role
+        {
+            merge_file_changes(&mut changes, message.file_changes.clone());
+        }
+    }
+    changes
 }
 
 fn should_show_role_header(
@@ -1444,6 +1546,7 @@ struct TranscriptView {
     workspace: WeakEntity<workspace::Workspace>,
     active_thread: Option<Arc<HarnessThread>>,
     expanded_tool_messages: HashSet<(SharedString, usize)>,
+    expanded_file_changes: HashSet<(SharedString, usize, SharedString)>,
     markdown_cache: HashMap<(SharedString, usize), (SharedString, Entity<Markdown>)>,
     user_message_editor_cache: HashMap<(SharedString, usize), (String, Entity<Editor>)>,
     list_state: ListState,
@@ -1457,6 +1560,7 @@ impl TranscriptView {
             workspace: workspace.downgrade(),
             active_thread: None,
             expanded_tool_messages: HashSet::default(),
+            expanded_file_changes: HashSet::default(),
             markdown_cache: HashMap::default(),
             user_message_editor_cache: HashMap::default(),
             list_state,
@@ -1478,6 +1582,7 @@ impl TranscriptView {
 
         if previous_thread_id != next_thread_id {
             self.expanded_tool_messages.clear();
+            self.expanded_file_changes.clear();
             self.markdown_cache.clear();
             self.user_message_editor_cache.clear();
             self.list_state.reset(self.item_count());
@@ -1534,6 +1639,20 @@ impl TranscriptView {
         let key = (thread_id, index);
         if !self.expanded_tool_messages.remove(&key) {
             self.expanded_tool_messages.insert(key);
+        }
+        cx.notify();
+    }
+
+    fn toggle_file_change_expansion(
+        &mut self,
+        thread_id: SharedString,
+        index: usize,
+        path: SharedString,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (thread_id, index, path);
+        if !self.expanded_file_changes.remove(&key) {
+            self.expanded_file_changes.insert(key);
         }
         cx.notify();
     }
@@ -1630,8 +1749,18 @@ impl TranscriptView {
                 *status,
                 title,
                 &message.text,
+                &message.file_changes,
                 message.duration_ms,
                 window,
+                cx,
+            );
+        }
+
+        if matches!(message.role, TranscriptRole::ChangeSummary) {
+            return self.render_change_summary_message(
+                thread_id,
+                index,
+                &message.file_changes,
                 cx,
             );
         }
@@ -1644,6 +1773,7 @@ impl TranscriptView {
             TranscriptRole::User => ("You".into(), Color::Muted, colors.element_background),
             TranscriptRole::Assistant => ("Codex".into(), Color::Muted, colors.editor_background),
             TranscriptRole::System => ("System".into(), Color::Warning, colors.element_hover),
+            TranscriptRole::ChangeSummary => unreachable!(),
             TranscriptRole::Tool { .. } => unreachable!(),
         };
 
@@ -1749,6 +1879,7 @@ impl TranscriptView {
         status: ToolStatus,
         title: &SharedString,
         body: &str,
+        file_changes: &[HarnessFileChange],
         duration_ms: Option<u64>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1757,10 +1888,12 @@ impl TranscriptView {
         let key = (thread_id, index);
         let expanded = self.expanded_tool_messages.contains(&key);
         let has_body = !body.trim().is_empty();
+        let has_file_changes = !file_changes.is_empty();
         let is_running = status == ToolStatus::Running;
         let is_expandable = match kind {
             ToolDisplayKind::Reasoning => has_body,
             ToolDisplayKind::Command => true,
+            ToolDisplayKind::FileChange => has_body || has_file_changes || is_running,
             _ => has_body || is_running,
         };
         let colors = cx.theme().colors();
@@ -1799,7 +1932,14 @@ impl TranscriptView {
                     .into_any_element()
             }
         } else {
-            let (label_text, label_color) = if let Some((primary, _)) = &summary {
+            let (label_text, label_color) = if matches!(kind, ToolDisplayKind::FileChange)
+                && has_file_changes
+            {
+                (
+                    SharedString::from(format_file_change_count(file_changes.len())),
+                    Color::Default,
+                )
+            } else if let Some((primary, _)) = &summary {
                 (primary.clone(), Color::Default)
             } else {
                 (title.clone(), Color::Default)
@@ -1815,7 +1955,7 @@ impl TranscriptView {
             ToolDisplayKind::FileRead | ToolDisplayKind::FileChange
         );
         let detail_element: Option<AnyElement> = match (is_reasoning, &summary) {
-            (false, Some((_, Some(detail)))) if is_file_tool => {
+            (false, Some((_, Some(detail)))) if is_file_tool && !has_file_changes => {
                 let workspace = self.workspace.clone();
                 let file_path = detail.clone();
                 let cwd = self.active_thread.as_ref().map(|t| t.cwd.clone());
@@ -1904,6 +2044,8 @@ impl TranscriptView {
         if expanded {
             let body_element: AnyElement = if matches!(kind, ToolDisplayKind::Command) {
                 self.render_command_body(title, body, status, cx)
+            } else if matches!(kind, ToolDisplayKind::FileChange) && has_file_changes {
+                self.render_file_changes(key.0.clone(), key.1, file_changes, true, false, cx)
             } else if has_body && matches!(kind, ToolDisplayKind::McpToolCall) {
                 self.render_mcp_tool_body(body, cx)
             } else if has_body && is_reasoning {
@@ -1981,6 +2123,225 @@ impl TranscriptView {
         }
 
         row.into_any_element()
+    }
+
+    fn render_change_summary_message(
+        &mut self,
+        thread_id: SharedString,
+        index: usize,
+        file_changes: &[HarnessFileChange],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+
+        v_flex()
+            .id(("harness-change-summary", index))
+            .w_full()
+            .rounded_lg()
+            .bg(colors.element_background)
+            .border_1()
+            .border_color(colors.border)
+            .overflow_hidden()
+            .child(
+                h_flex()
+                    .px_3()
+                    .py_2()
+                    .justify_between()
+                    .child(
+                        Label::new(format_file_change_count(file_changes.len()))
+                            .size(LabelSize::Small)
+                            .color(Color::Default),
+                    )
+                    .child(
+                        ui::DiffStat::new(
+                            ("change-summary-stat", index),
+                            total_added_lines(file_changes),
+                            total_removed_lines(file_changes),
+                        )
+                        .label_size(LabelSize::Small),
+                    ),
+            )
+            .child(self.render_file_changes(thread_id, index, file_changes, false, true, cx))
+            .into_any_element()
+    }
+
+    fn render_file_changes(
+        &mut self,
+        thread_id: SharedString,
+        message_index: usize,
+        file_changes: &[HarnessFileChange],
+        indented: bool,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let element_background = cx.theme().colors().element_background;
+        let element_hover = cx.theme().colors().element_hover;
+        let mut list = v_flex()
+            .w_full()
+            .gap_1()
+            .when(indented, |this| this.ml(px(20.0)));
+
+        for (change_index, change) in file_changes.iter().enumerate() {
+            let path = change.path.clone();
+            let expanded = self.expanded_file_changes.contains(&(
+                thread_id.clone(),
+                message_index,
+                path.clone(),
+            ));
+            let key_thread_id = thread_id.clone();
+            let key_path = path.clone();
+            let display_path = self.file_change_display_path(path.as_ref(), cx);
+            let hover_background = element_hover;
+            let chevron = if expanded {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            };
+
+            let row = h_flex()
+                .id(SharedString::from(format!(
+                    "file-change-row-{message_index}-{change_index}"
+                )))
+                .w_full()
+                .gap_1p5()
+                .items_center()
+                .px_3()
+                .py_1p5()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(move |style| style.bg(hover_background))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.toggle_file_change_expansion(
+                        key_thread_id.clone(),
+                        message_index,
+                        key_path.clone(),
+                        cx,
+                    );
+                }))
+                .child(
+                    Icon::new(chevron)
+                        .size(IconSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    Label::new(display_path)
+                        .size(LabelSize::Small)
+                        .color(Color::Default)
+                        .truncate(),
+                )
+                .child(div().flex_1())
+                .child(
+                    ui::DiffStat::new(
+                        SharedString::from(format!(
+                            "file-change-stat-{message_index}-{change_index}"
+                        )),
+                        change.added_lines,
+                        change.removed_lines,
+                    )
+                    .label_size(LabelSize::Small),
+                );
+
+            let mut item = v_flex().w_full().child(row);
+            if expanded {
+                item = item.child(self.render_file_change_diff(change, compact, cx));
+            }
+            list = list.child(item);
+        }
+
+        list.when(file_changes.is_empty(), |this| {
+            this.px_3()
+                .py_2()
+                .rounded_md()
+                .bg(element_background)
+                .text_sm()
+                .text_color(Color::Muted.color(cx))
+                .child("No file changes reported")
+        })
+        .into_any_element()
+    }
+
+    fn file_change_display_path(&self, path: &str, cx: &App) -> SharedString {
+        let normalized_path = normalized_file_change_path(path);
+        let Some(workspace) = self.workspace.upgrade() else {
+            return normalized_path.to_string_lossy().to_string().into();
+        };
+
+        let root_paths = workspace.read(cx).root_paths(cx);
+        let include_root_name = root_paths.len() > 1;
+        for root_path in &root_paths {
+            let root_path = root_path.as_ref();
+            if let Ok(relative_path) = normalized_path.strip_prefix(root_path) {
+                if include_root_name
+                    && let Some(root_name) = root_path.file_name().and_then(|name| name.to_str())
+                {
+                    return format!("{root_name}/{}", relative_path.to_string_lossy()).into();
+                }
+                return relative_path.to_string_lossy().to_string().into();
+            }
+        }
+
+        if let Some(thread) = self.active_thread.as_ref()
+            && let Ok(relative_path) = normalized_path.strip_prefix(&thread.cwd)
+        {
+            return relative_path.to_string_lossy().to_string().into();
+        }
+
+        normalized_path.to_string_lossy().to_string().into()
+    }
+
+    fn render_file_change_diff(
+        &self,
+        change: &HarnessFileChange,
+        compact: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let Some(diff) = change.unified_diff.as_deref() else {
+            return div()
+                .ml(px(20.0))
+                .px_3()
+                .py_2()
+                .text_sm()
+                .text_color(Color::Muted.color(cx))
+                .child("Diff preview unavailable")
+                .into_any_element();
+        };
+
+        let max_lines = if compact { 96 } else { 160 };
+        let mut lines = diff.lines().take(max_lines + 1).collect::<Vec<_>>();
+        let truncated = lines.len() > max_lines;
+        if truncated {
+            lines.truncate(max_lines);
+        }
+
+        let mut preview = v_flex()
+            .ml(px(20.0))
+            .rounded_md()
+            .border_1()
+            .border_color(colors.border)
+            .bg(colors.editor_background)
+            .overflow_hidden();
+
+        for line in lines {
+            preview = preview.child(render_diff_line(line, cx));
+        }
+
+        if truncated {
+            preview = preview.child(
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .font_buffer(cx)
+                    .text_color(Color::Muted.color(cx))
+                    .child("… diff truncated"),
+            );
+        }
+
+        preview.into_any_element()
     }
 
     fn render_command_body(
@@ -2518,8 +2879,10 @@ impl AgentsSurface {
         self.available_skills_loaded = false;
         let loaded_cwd = cwd.clone();
         self.skills_refresh_task = Some(cx.spawn(async move |this, cx| {
-            let load_task =
-                cx.background_spawn(async move { load_codex_available_skills(cwd).await });
+            let executor = cx.background_executor().clone();
+            let load_task = cx.background_spawn(async move {
+                load_codex_available_skills(cwd, executor).await
+            });
             let result = load_task.await;
             this.update(cx, |this, cx| {
                 if this.available_skills_cwd.as_ref() != Some(&loaded_cwd) {
@@ -2826,6 +3189,7 @@ impl AgentsSurface {
             thread_id: thread_id.clone(),
             provider_thread_id: thread.provider_thread_id.clone(),
             cwd: thread.cwd.clone(),
+            executor: cx.background_executor().clone(),
             model: self.selected_model.clone(),
             approval_policy: HarnessApprovalPolicy::Never,
             sandbox_policy: self.selected_sandbox_policy.clone(),
@@ -2906,6 +3270,7 @@ impl AgentsSurface {
             text,
             attachments,
             file_mentions,
+            file_changes: Vec::new(),
             started_at: None,
             duration_ms: None,
         });
@@ -2991,7 +3356,7 @@ impl AgentsSurface {
             HarnessTurnUpdate::AssistantDelta { thread_id, delta } => {
                 if let Some(thread) = self.thread_mut(&thread_id) {
                     thread.run_status = HarnessRunStatus::Running;
-                    complete_running_commands(thread);
+                    complete_running_commands(thread, None);
                     if !thread.has_reported_tokens {
                         thread.estimated_tokens_used += delta.len() / 4;
                     }
@@ -3012,12 +3377,19 @@ impl AgentsSurface {
                 phase,
                 title,
                 detail,
+                file_changes,
             } => {
                 if let Some(thread) = self.thread_mut(&thread_id) {
                     thread.run_status = HarnessRunStatus::Running;
                     let display_kind = ToolDisplayKind::from_harness(&kind);
-                    if display_kind != ToolDisplayKind::Command {
-                        complete_running_commands(thread);
+                    match (display_kind, phase) {
+                        (ToolDisplayKind::Command, HarnessToolPhase::Start) => {
+                            complete_running_commands(thread, item_id.as_deref());
+                        }
+                        (kind, _) if kind != ToolDisplayKind::Command => {
+                            complete_running_commands(thread, None);
+                        }
+                        _ => {}
                     }
 
                     let existing = thread.messages.iter_mut().rev().find(|message| {
@@ -3103,6 +3475,7 @@ impl AgentsSurface {
                                 message.text.push_str(&detail);
                             }
                         }
+                        merge_file_changes(&mut message.file_changes, file_changes);
                     } else {
                         let status = tool_status_after_phase(ToolStatus::Running, phase);
                         let mut new_message = TranscriptMessage::new(
@@ -3114,6 +3487,7 @@ impl AgentsSurface {
                             },
                             detail.to_string(),
                         );
+                        new_message.file_changes = file_changes;
                         // Only stamp a start time when the tool is actually
                         // starting — if we get here on a terminal phase with
                         // no prior Running record, we have no duration to
@@ -3142,6 +3516,20 @@ impl AgentsSurface {
                             if *status == ToolStatus::Running {
                                 *status = ToolStatus::Completed;
                             }
+                        }
+                    }
+                    if !matches!(
+                        thread.messages.last().map(|message| &message.role),
+                        Some(TranscriptRole::ChangeSummary)
+                    ) {
+                        let file_changes = latest_turn_file_changes(thread);
+                        if !file_changes.is_empty() {
+                            let mut summary = TranscriptMessage::new(
+                                TranscriptRole::ChangeSummary,
+                                String::new(),
+                            );
+                            summary.file_changes = file_changes;
+                            thread.messages.push(summary);
                         }
                     }
                 }
@@ -3220,6 +3608,9 @@ impl AgentsSurface {
                                             SerializedTranscriptRole::Assistant
                                         }
                                         TranscriptRole::System => SerializedTranscriptRole::System,
+                                        TranscriptRole::ChangeSummary => {
+                                            SerializedTranscriptRole::ChangeSummary
+                                        }
                                         TranscriptRole::Tool {
                                             item_id,
                                             kind,
@@ -3234,6 +3625,16 @@ impl AgentsSurface {
                                     },
                                     text: message.text.clone(),
                                     attachments: message.attachments.clone(),
+                                    file_changes: message
+                                        .file_changes
+                                        .iter()
+                                        .map(|change| SerializedFileChange {
+                                            path: change.path.to_string(),
+                                            added_lines: change.added_lines,
+                                            removed_lines: change.removed_lines,
+                                            unified_diff: change.unified_diff.clone(),
+                                        })
+                                        .collect(),
                                     duration_ms: message.duration_ms,
                                 })
                                 .collect(),
@@ -3277,6 +3678,9 @@ impl AgentsSurface {
                             SerializedTranscriptRole::User => TranscriptRole::User,
                             SerializedTranscriptRole::Assistant => TranscriptRole::Assistant,
                             SerializedTranscriptRole::System => TranscriptRole::System,
+                            SerializedTranscriptRole::ChangeSummary => {
+                                TranscriptRole::ChangeSummary
+                            }
                             SerializedTranscriptRole::Tool {
                                 title,
                                 item_id,
@@ -3311,6 +3715,16 @@ impl AgentsSurface {
                             text,
                             attachments: message.attachments,
                             file_mentions,
+                            file_changes: message
+                                .file_changes
+                                .into_iter()
+                                .map(|change| HarnessFileChange {
+                                    path: change.path.into(),
+                                    added_lines: change.added_lines,
+                                    removed_lines: change.removed_lines,
+                                    unified_diff: change.unified_diff,
+                                })
+                                .collect(),
                             started_at: None,
                             duration_ms: message.duration_ms,
                         }
@@ -4131,7 +4545,7 @@ mod tests {
             has_reported_tokens: false,
         };
 
-        complete_running_commands(&mut thread);
+        complete_running_commands(&mut thread, None);
 
         match &thread.messages[0].role {
             TranscriptRole::Tool {
@@ -4149,6 +4563,63 @@ mod tests {
                 ..
             } => assert_eq!(*status, ToolStatus::Running),
             _ => panic!("expected file change tool message"),
+        }
+    }
+
+    #[test]
+    fn keeps_new_command_running_while_finishing_older_ones() {
+        let mut thread = HarnessThread {
+            id: HarnessThreadId("thread-1".into()),
+            provider_thread_id: None,
+            title: "Thread".into(),
+            cwd: Default::default(),
+            harness_kind: HarnessKind::Codex,
+            run_status: HarnessRunStatus::Running,
+            messages: vec![
+                {
+                    let mut message = TranscriptMessage::new(
+                        TranscriptRole::Tool {
+                            item_id: Some("cmd-1".to_string()),
+                            kind: ToolDisplayKind::Command,
+                            status: ToolStatus::Running,
+                            title: "Run command: pwd".into(),
+                        },
+                        String::new(),
+                    );
+                    message.started_at = Some(std::time::Instant::now());
+                    message
+                },
+                TranscriptMessage::new(
+                    TranscriptRole::Tool {
+                        item_id: Some("cmd-2".to_string()),
+                        kind: ToolDisplayKind::Command,
+                        status: ToolStatus::Running,
+                        title: "Run command: ls".into(),
+                    },
+                    String::new(),
+                ),
+            ],
+            estimated_tokens_used: 0,
+            has_reported_tokens: false,
+        };
+
+        complete_running_commands(&mut thread, Some("cmd-2"));
+
+        match &thread.messages[0].role {
+            TranscriptRole::Tool {
+                status,
+                kind: ToolDisplayKind::Command,
+                ..
+            } => assert_eq!(*status, ToolStatus::Completed),
+            _ => panic!("expected command tool message"),
+        }
+        match &thread.messages[1].role {
+            TranscriptRole::Tool {
+                status,
+                kind: ToolDisplayKind::Command,
+                ..
+            } => assert_eq!(*status, ToolStatus::Running),
+            _ => panic!("expected command tool message"),
         }
     }
 
