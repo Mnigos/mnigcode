@@ -1412,7 +1412,11 @@ fn extract_total_tokens(params: &Value) -> Option<usize> {
 
 enum RawSessionCommandEvent {
     Started { call_id: String, tool_name: String },
-    Completed { call_id: String, output: String },
+    Completed {
+        call_id: String,
+        tool_name: Option<String>,
+        output: String,
+    },
 }
 
 async fn stream_exec_command_outputs_from_session(
@@ -1427,59 +1431,95 @@ async fn stream_exec_command_outputs_from_session(
     let mut partial = Vec::new();
 
     loop {
-        if stop.try_recv().is_ok() {
+        let stop_requested = stop.try_recv().is_ok();
+        drain_new_session_lines(
+            &session_path,
+            &mut offset,
+            &thread_id,
+            &updates,
+            &mut pending_tool_names,
+            &mut partial,
+        )
+        .await;
+        if stop_requested {
             break;
         }
 
-        match read_new_session_lines(&session_path, offset) {
-            Ok(Some((new_offset, bytes))) => {
-                offset = new_offset;
-                partial.extend_from_slice(&bytes);
+        executor.timer(Duration::from_millis(150)).await;
+        if stop.try_recv().is_ok() {
+            drain_new_session_lines(
+                &session_path,
+                &mut offset,
+                &thread_id,
+                &updates,
+                &mut pending_tool_names,
+                &mut partial,
+            )
+            .await;
+            break;
+        }
+    }
+}
 
-                while let Some(newline_index) = partial.iter().position(|byte| *byte == b'\n') {
-                    let line = partial.drain(..=newline_index).collect::<Vec<_>>();
-                    let line = &line[..line.len().saturating_sub(1)];
-                    if line.is_empty() {
-                        continue;
-                    }
+async fn drain_new_session_lines(
+    session_path: &Path,
+    offset: &mut u64,
+    thread_id: &HarnessThreadId,
+    updates: &Sender<HarnessTurnUpdate>,
+    pending_tool_names: &mut HashMap<String, String>,
+    partial: &mut Vec<u8>,
+) {
+    match read_new_session_lines(session_path, *offset) {
+        Ok(Some((new_offset, bytes))) => {
+            *offset = new_offset;
+            partial.extend_from_slice(&bytes);
 
-                    match parse_raw_session_command_event(line) {
-                        Some(RawSessionCommandEvent::Started { call_id, tool_name }) => {
-                            pending_tool_names.insert(call_id, tool_name);
-                        }
-                        Some(RawSessionCommandEvent::Completed { call_id, output }) => {
-                            if pending_tool_names.get(&call_id).map(String::as_str)
-                                == Some("exec_command")
-                            {
-                                send_update(
-                                    &updates,
-                                    HarnessTurnUpdate::ToolEvent {
-                                        thread_id: thread_id.clone(),
-                                        item_id: Some(call_id),
-                                        kind: HarnessToolKind::Command,
-                                        phase: HarnessToolPhase::Update,
-                                        title: SharedString::default(),
-                                        detail: output.into(),
-                                        file_changes: Vec::new(),
-                                    },
-                                )
-                                .await;
-                            }
-                        }
-                        None => {}
+            while let Some(newline_index) = partial.iter().position(|byte| *byte == b'\n') {
+                let line = partial.drain(..=newline_index).collect::<Vec<_>>();
+                let line = &line[..line.len().saturating_sub(1)];
+                if line.is_empty() {
+                    continue;
+                }
+
+                match parse_raw_session_command_event(line) {
+                    Some(RawSessionCommandEvent::Started { call_id, tool_name }) => {
+                        pending_tool_names.insert(call_id, tool_name);
                     }
+                    Some(RawSessionCommandEvent::Completed {
+                        call_id,
+                        tool_name,
+                        output,
+                    }) => {
+                        let pending_tool_name = pending_tool_names.remove(&call_id);
+                        if pending_tool_name.as_deref() == Some("exec_command")
+                            || tool_name.as_deref() == Some("exec_command")
+                        {
+                            send_update(
+                                updates,
+                                HarnessTurnUpdate::ToolEvent {
+                                    thread_id: thread_id.clone(),
+                                    item_id: Some(call_id),
+                                    kind: HarnessToolKind::Command,
+                                    phase: HarnessToolPhase::Update,
+                                    title: SharedString::default(),
+                                    detail: output.into(),
+                                    file_changes: Vec::new(),
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                    None => {}
                 }
             }
-            Ok(None) => {}
-            Err(error) => {
-                log::debug!(
-                    "failed to read raw codex session output from {}: {error}",
-                    session_path.display()
-                );
-            }
         }
-
-        executor.timer(Duration::from_millis(150)).await;
+        Ok(None) => {}
+        Err(error) => {
+            log::debug!(
+                "failed to read raw codex session output from {}: {error}",
+                session_path.display()
+            );
+        }
     }
 }
 
@@ -1498,7 +1538,8 @@ fn read_new_session_lines(path: &Path, offset: u64) -> Result<Option<(u64, Vec<u
     file.seek(SeekFrom::Start(offset))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    Ok(Some((file_len, bytes)))
+    let new_offset = file.stream_position()?;
+    Ok(Some((new_offset, bytes)))
 }
 
 fn parse_raw_session_command_event(line: &[u8]) -> Option<RawSessionCommandEvent> {
@@ -1520,6 +1561,10 @@ fn parse_raw_session_command_event(line: &[u8]) -> Option<RawSessionCommandEvent
         {
             Some(RawSessionCommandEvent::Completed {
                 call_id: payload.get("call_id").and_then(Value::as_str)?.to_string(),
+                tool_name: payload
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 output: extract_exec_command_output(
                     payload.get("output").and_then(Value::as_str)?,
                 )?,
@@ -1559,6 +1604,7 @@ fn parse_raw_session_command_event(line: &[u8]) -> Option<RawSessionCommandEvent
 
             Some(RawSessionCommandEvent::Completed {
                 call_id: payload.get("call_id").and_then(Value::as_str)?.to_string(),
+                tool_name: Some("exec_command".to_string()),
                 output,
             })
         }
@@ -1899,11 +1945,16 @@ fn tool_title(
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        io::Write,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use serde_json::json;
 
     use super::{
         HarnessToolKind, RawSessionCommandEvent, extract_exec_command_output,
-        parse_raw_session_command_event, parse_tool_event,
+        parse_raw_session_command_event, parse_tool_event, read_new_session_lines,
     };
 
     #[test]
@@ -2103,8 +2154,13 @@ mod tests {
         let event = parse_raw_session_command_event(line).unwrap();
 
         match event {
-            RawSessionCommandEvent::Completed { call_id, output } => {
+            RawSessionCommandEvent::Completed {
+                call_id,
+                tool_name,
+                output,
+            } => {
                 assert_eq!(call_id, "call_123");
+                assert_eq!(tool_name, None);
                 assert_eq!(output, "hello\nworld");
             }
             RawSessionCommandEvent::Started { .. } => panic!("expected completed event"),
@@ -2118,12 +2174,41 @@ mod tests {
         let event = parse_raw_session_command_event(line).unwrap();
 
         match event {
-            RawSessionCommandEvent::Completed { call_id, output } => {
+            RawSessionCommandEvent::Completed {
+                call_id,
+                tool_name,
+                output,
+            } => {
                 assert_eq!(call_id, "call_456");
+                assert_eq!(tool_name.as_deref(), Some("exec_command"));
                 assert_eq!(output, "hello\nworld\n");
             }
             RawSessionCommandEvent::Started { .. } => panic!("expected completed event"),
         }
+    }
+
+    #[test]
+    fn read_new_session_lines_advances_by_consumed_bytes() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "mnigcode-harness-offset-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        let mut file = std::fs::File::create(&path).unwrap();
+        write!(file, "hello world").unwrap();
+        drop(file);
+
+        let (new_offset, bytes) = read_new_session_lines(&path, 6)
+            .unwrap()
+            .expect("expected new bytes");
+
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), "world");
+        assert_eq!(new_offset, 11);
+
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
