@@ -1456,9 +1456,7 @@ fn merge_file_changes(existing: &mut Vec<HarnessFileChange>, incoming: Vec<Harne
 
             existing_change.added_lines = incoming_change.added_lines;
             existing_change.removed_lines = incoming_change.removed_lines;
-            if let Some(diff) = incoming_change.unified_diff {
-                existing_change.unified_diff = Some(diff);
-            }
+            existing_change.unified_diff = incoming_change.unified_diff;
         } else {
             existing.push(incoming_change);
         }
@@ -4987,6 +4985,31 @@ mod tests {
             merged[0].unified_diff.as_deref(),
             Some("@@ -1 +1,2 @@\n-old\n+new\n+more")
         );
+    }
+
+    #[test]
+    fn clears_stale_diff_when_updated_snapshot_omits_diff() {
+        let mut merged = vec![HarnessFileChange {
+            path: "src/main.rs".into(),
+            added_lines: 3,
+            removed_lines: 1,
+            unified_diff: Some("@@ -1 +1 @@\n-old\n+new".to_string()),
+        }];
+
+        merge_file_changes(
+            &mut merged,
+            vec![HarnessFileChange {
+                path: "src/main.rs".into(),
+                added_lines: 5,
+                removed_lines: 2,
+                unified_diff: None,
+            }],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].added_lines, 5);
+        assert_eq!(merged[0].removed_lines, 2);
+        assert_eq!(merged[0].unified_diff, None);
     }
 
     #[test]
