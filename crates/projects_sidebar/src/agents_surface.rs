@@ -2654,11 +2654,7 @@ impl TranscriptView {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let colors = cx.theme().colors();
-        let command_text: SharedString = title
-            .split_once(": ")
-            .map(|(_, cmd)| cmd.to_string())
-            .unwrap_or_default()
-            .into();
+        let command_text = command_text_from_title(title);
         let output_text: Option<SharedString> = if body.trim().is_empty() {
             None
         } else {
