@@ -126,6 +126,12 @@ pub enum HarnessSkillSource {
     Local,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HarnessTokenUsageSource {
+    Native,
+    Legacy,
+}
+
 #[derive(Clone, Debug)]
 pub enum HarnessTurnUpdate {
     Status {
@@ -149,9 +155,11 @@ pub enum HarnessTurnUpdate {
         detail: SharedString,
         file_changes: Vec<HarnessFileChange>,
     },
-    TokensUsed {
+    TokenUsage {
         thread_id: HarnessThreadId,
-        total_tokens: usize,
+        tokens_used: usize,
+        model_context_window: Option<usize>,
+        source: HarnessTokenUsageSource,
     },
     Finished {
         thread_id: HarnessThreadId,
@@ -780,13 +788,22 @@ async fn handle_notification(
         "turn/started" => {
             send_status(updates, thread_id.clone(), HarnessRunStatus::Running).await;
         }
-        "turn/completed" => {
-            if let Some(total_tokens) = params.and_then(extract_total_tokens) {
+        "turn/completed" | "thread/tokenUsage/updated" => {
+            if let Some((tokens_used, model_context_window)) =
+                params.and_then(extract_thread_token_usage)
+            {
+                let source = if method == "thread/tokenUsage/updated" {
+                    HarnessTokenUsageSource::Native
+                } else {
+                    HarnessTokenUsageSource::Legacy
+                };
                 send_update(
                     updates,
-                    HarnessTurnUpdate::TokensUsed {
+                    HarnessTurnUpdate::TokenUsage {
                         thread_id: thread_id.clone(),
-                        total_tokens,
+                        tokens_used,
+                        model_context_window,
+                        source,
                     },
                 )
                 .await;
@@ -1049,7 +1066,8 @@ fn extract_tool_detail(
             }
             return snapshot.into();
         }
-        if let Some(delta) = command_output_delta(params, item_payload).or_else(|| lookup("delta")) {
+        if let Some(delta) = command_output_delta(params, item_payload).or_else(|| lookup("delta"))
+        {
             return delta.into();
         }
         // Nothing useful on a pure "completed" event with no output field.
@@ -1097,10 +1115,7 @@ fn extract_tool_detail(
     SharedString::default()
 }
 
-fn extract_file_changes(
-    kind: &HarnessToolKind,
-    params: Option<&Value>,
-) -> Vec<HarnessFileChange> {
+fn extract_file_changes(kind: &HarnessToolKind, params: Option<&Value>) -> Vec<HarnessFileChange> {
     if !matches!(kind, HarnessToolKind::FileChange) {
         return Vec::new();
     }
@@ -1143,22 +1158,28 @@ fn file_change_from_value(path_hint: Option<&str>, value: &Value) -> Option<Harn
     let object = value.as_object();
     let lookup_string = |keys: &[&str]| -> Option<String> {
         keys.iter()
-            .find_map(|key| object.and_then(|object| object.get(*key)).and_then(Value::as_str))
+            .find_map(|key| {
+                object
+                    .and_then(|object| object.get(*key))
+                    .and_then(Value::as_str)
+            })
             .map(str::to_string)
     };
     let lookup_usize = |keys: &[&str]| -> Option<usize> {
         keys.iter()
-            .find_map(|key| object.and_then(|object| object.get(*key)).and_then(Value::as_u64))
+            .find_map(|key| {
+                object
+                    .and_then(|object| object.get(*key))
+                    .and_then(Value::as_u64)
+            })
             .map(|value| value as usize)
     };
 
     let path = path_hint
         .map(str::to_string)
-        .or_else(|| {
-            lookup_string(&["path", "filePath", "file", "relativePath", "absolutePath"])
-        })?;
-    let unified_diff = lookup_string(&["unified_diff", "unifiedDiff", "diff", "patch"])
-        .or_else(|| {
+        .or_else(|| lookup_string(&["path", "filePath", "file", "relativePath", "absolutePath"]))?;
+    let unified_diff =
+        lookup_string(&["unified_diff", "unifiedDiff", "diff", "patch"]).or_else(|| {
             let old_text = lookup_string(&["old_text", "oldText", "before"]);
             let new_text = lookup_string(&["new_text", "newText", "after"]);
             match (old_text, new_text) {
@@ -1268,7 +1289,9 @@ fn command_string(params: &Value, item_payload: Option<&Value>) -> Option<String
 
 fn command_output_snapshot(params: &Value, item_payload: Option<&Value>) -> Option<String> {
     for key in ["aggregated_output", "aggregatedOutput", "output"] {
-        if let Some(value) = params.get(key).or_else(|| item_payload.and_then(|item| item.get(key)))
+        if let Some(value) = params
+            .get(key)
+            .or_else(|| item_payload.and_then(|item| item.get(key)))
             && let Some(rendered) = render_command_output_value(value)
         {
             return Some(rendered);
@@ -1302,7 +1325,9 @@ fn command_output_snapshot(params: &Value, item_payload: Option<&Value>) -> Opti
 
 fn command_output_delta(params: &Value, item_payload: Option<&Value>) -> Option<String> {
     for key in ["delta", "text"] {
-        if let Some(value) = params.get(key).or_else(|| item_payload.and_then(|item| item.get(key)))
+        if let Some(value) = params
+            .get(key)
+            .or_else(|| item_payload.and_then(|item| item.get(key)))
             && let Some(rendered) = render_command_output_value(value)
         {
             return Some(rendered);
@@ -1385,41 +1410,61 @@ fn render_command_output_value(value: &Value) -> Option<String> {
     }
 }
 
-fn extract_total_tokens(params: &Value) -> Option<usize> {
+fn extract_thread_token_usage(params: &Value) -> Option<(usize, Option<usize>)> {
     let usage = params
-        .get("usage")
-        .or_else(|| params.get("tokenUsage"))
-        .or_else(|| params.get("token_usage"))?;
-
-    if let Some(total) = usage
-        .get("totalTokens")
-        .or_else(|| usage.get("total_tokens"))
+        .get("tokenUsage")
+        .or_else(|| params.get("token_usage"))
+        .or_else(|| params.get("usage"))?;
+    let current = usage
+        .get("last")
         .or_else(|| usage.get("total"))
+        .unwrap_or(usage);
+    let tokens_used = extract_token_usage_breakdown_total(current)?;
+    let model_context_window = usage
+        .get("modelContextWindow")
+        .or_else(|| usage.get("model_context_window"))
         .and_then(Value::as_u64)
-    {
-        return Some(total as usize);
+        .map(|value| value as usize);
+
+    Some((tokens_used, model_context_window))
+}
+
+fn extract_token_usage_breakdown_total(breakdown: &Value) -> Option<usize> {
+    if let Some(total_tokens) = breakdown.as_u64() {
+        return Some(total_tokens as usize);
     }
 
-    // `inputTokens` already includes `cachedInputTokens` and `outputTokens`
-    // already includes `reasoningTokens` in OpenAI's usage schema, so only
-    // sum the two top-level buckets here when a pre-computed total is absent.
-    let input = usage
-        .get("inputTokens")
-        .or_else(|| usage.get("input_tokens"))
+    if let Some(total_tokens) = breakdown
+        .get("totalTokens")
+        .or_else(|| breakdown.get("total_tokens"))
         .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let output = usage
-        .get("outputTokens")
-        .or_else(|| usage.get("output_tokens"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    {
+        return Some(total_tokens as usize);
+    }
 
-    let sum = input + output;
-    if sum > 0 { Some(sum as usize) } else { None }
+    let input_tokens = breakdown
+        .get("inputTokens")
+        .or_else(|| breakdown.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output_tokens = breakdown
+        .get("outputTokens")
+        .or_else(|| breakdown.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let tokens_used = input_tokens + output_tokens;
+    if tokens_used == 0 {
+        None
+    } else {
+        Some(tokens_used as usize)
+    }
 }
 
 enum RawSessionCommandEvent {
-    Started { call_id: String, tool_name: String },
+    Started {
+        call_id: String,
+        tool_name: String,
+    },
     Completed {
         call_id: String,
         tool_name: Option<String>,
@@ -1511,13 +1556,8 @@ async fn drain_new_session_lines(
                 }
 
                 if let Some(event) = parse_raw_session_command_event(line) {
-                    handle_parsed_command_event(
-                        event,
-                        thread_id,
-                        updates,
-                        pending_tool_names,
-                    )
-                    .await;
+                    handle_parsed_command_event(event, thread_id, updates, pending_tool_names)
+                        .await;
                 }
             }
         }
@@ -1609,9 +1649,7 @@ fn parse_raw_session_command_event(line: &[u8]) -> Option<RawSessionCommandEvent
     let payload = value.get("payload")?;
 
     match kind {
-        "response_item"
-            if payload.get("type").and_then(Value::as_str) == Some("function_call") =>
-        {
+        "response_item" if payload.get("type").and_then(Value::as_str) == Some("function_call") => {
             Some(RawSessionCommandEvent::Started {
                 call_id: payload.get("call_id").and_then(Value::as_str)?.to_string(),
                 tool_name: payload.get("name").and_then(Value::as_str)?.to_string(),
@@ -1800,16 +1838,8 @@ fn extract_mcp_tool_arguments<'a>(
     ];
 
     item_payload
-        .and_then(|item| {
-            argument_keys
-                .iter()
-                .find_map(|key| item.get(*key))
-        })
-        .or_else(|| {
-            argument_keys
-                .iter()
-                .find_map(|key| params.get(*key))
-        })
+        .and_then(|item| argument_keys.iter().find_map(|key| item.get(*key)))
+        .or_else(|| argument_keys.iter().find_map(|key| params.get(*key)))
 }
 
 fn format_mcp_tool_arguments(arguments: &Value) -> Option<String> {
@@ -1882,7 +1912,8 @@ fn format_mcp_argument_value(value: &Value) -> String {
                     value,
                     Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
                 )
-            }) => {
+            }) =>
+        {
             values
                 .iter()
                 .map(format_mcp_argument_value)
@@ -2015,10 +2046,10 @@ mod tests {
     use smol::channel;
 
     use super::{
-        HarnessThreadId, HarnessToolKind, HarnessTurnUpdate, RawSessionCommandEvent,
-        extract_exec_command_output, finalize_partial_command_record,
-        handle_notification, parse_raw_session_command_event, parse_tool_event,
-        read_new_session_lines,
+        HarnessThreadId, HarnessTokenUsageSource, HarnessToolKind, HarnessTurnUpdate,
+        RawSessionCommandEvent, extract_exec_command_output, extract_thread_token_usage,
+        finalize_partial_command_record, handle_notification, parse_raw_session_command_event,
+        parse_tool_event, read_new_session_lines,
     };
 
     #[test]
@@ -2184,7 +2215,10 @@ mod tests {
 
         assert_eq!(event.kind, HarnessToolKind::Command);
         assert_eq!(event.phase, super::HarnessToolPhase::End);
-        assert_eq!(event.detail.as_ref(), "Cost: $0.27732585\nDuration: 155780 ms");
+        assert_eq!(
+            event.detail.as_ref(),
+            "Cost: $0.27732585\nDuration: 155780 ms"
+        );
     }
 
     #[test]
@@ -2296,6 +2330,147 @@ mod tests {
 
             assert_eq!(error.to_string(), "turn exploded");
             assert!(updates_rx.try_recv().is_err());
+        });
+    }
+
+    #[test]
+    fn extracts_native_thread_token_usage() {
+        let params = json!({
+            "threadId": "provider-thread",
+            "turnId": "turn-1",
+            "tokenUsage": {
+                "total": {
+                    "totalTokens": 42_000,
+                    "inputTokens": 40_000,
+                    "cachedInputTokens": 1_000,
+                    "outputTokens": 2_000,
+                    "reasoningOutputTokens": 500
+                },
+                "last": {
+                    "totalTokens": 900,
+                    "inputTokens": 700,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 200,
+                    "reasoningOutputTokens": 50
+                },
+                "modelContextWindow": 256_000
+            }
+        });
+
+        assert_eq!(
+            extract_thread_token_usage(&params),
+            Some((900, Some(256_000)))
+        );
+    }
+
+    #[test]
+    fn extracts_legacy_flat_token_usage() {
+        let params = json!({
+            "usage": {
+                "inputTokens": 700,
+                "outputTokens": 200
+            }
+        });
+
+        assert_eq!(extract_thread_token_usage(&params), Some((900, None)));
+    }
+
+    #[test]
+    fn extracts_numeric_token_usage_total() {
+        let params = json!({
+            "usage": {
+                "total": 900
+            }
+        });
+
+        assert_eq!(extract_thread_token_usage(&params), Some((900, None)));
+    }
+
+    #[test]
+    fn native_token_usage_notification_emits_update() {
+        smol::block_on(async {
+            let (updates_tx, updates_rx) = channel::unbounded();
+            let params = json!({
+                "threadId": "provider-thread",
+                "turnId": "turn-1",
+                "tokenUsage": {
+                    "total": {
+                        "totalTokens": 42_000,
+                        "inputTokens": 40_000,
+                        "cachedInputTokens": 1_000,
+                        "outputTokens": 2_000,
+                        "reasoningOutputTokens": 500
+                    },
+                    "last": {
+                        "totalTokens": 900,
+                        "inputTokens": 700,
+                        "cachedInputTokens": 0,
+                        "outputTokens": 200,
+                        "reasoningOutputTokens": 50
+                    },
+                    "modelContextWindow": 256_000
+                }
+            });
+
+            handle_notification(
+                "thread/tokenUsage/updated",
+                Some(&params),
+                &HarnessThreadId("thread-1".into()),
+                &updates_tx,
+            )
+            .await
+            .unwrap();
+
+            match updates_rx.recv().await.unwrap() {
+                HarnessTurnUpdate::TokenUsage {
+                    thread_id,
+                    tokens_used,
+                    model_context_window,
+                    source,
+                } => {
+                    assert_eq!(thread_id, HarnessThreadId("thread-1".into()));
+                    assert_eq!(tokens_used, 900);
+                    assert_eq!(model_context_window, Some(256_000));
+                    assert_eq!(source, HarnessTokenUsageSource::Native);
+                }
+                other => panic!("unexpected update: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn turn_completed_usage_notification_emits_update() {
+        smol::block_on(async {
+            let (updates_tx, updates_rx) = channel::unbounded();
+            let params = json!({
+                "usage": {
+                    "totalTokens": 900
+                }
+            });
+
+            handle_notification(
+                "turn/completed",
+                Some(&params),
+                &HarnessThreadId("thread-1".into()),
+                &updates_tx,
+            )
+            .await
+            .unwrap();
+
+            match updates_rx.recv().await.unwrap() {
+                HarnessTurnUpdate::TokenUsage {
+                    thread_id,
+                    tokens_used,
+                    model_context_window,
+                    source,
+                } => {
+                    assert_eq!(thread_id, HarnessThreadId("thread-1".into()));
+                    assert_eq!(tokens_used, 900);
+                    assert_eq!(model_context_window, None);
+                    assert_eq!(source, HarnessTokenUsageSource::Legacy);
+                }
+                other => panic!("unexpected update: {other:?}"),
+            }
         });
     }
 
