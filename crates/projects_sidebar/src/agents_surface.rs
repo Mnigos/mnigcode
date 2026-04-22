@@ -1447,10 +1447,18 @@ fn merge_file_changes(existing: &mut Vec<HarnessFileChange>, incoming: Vec<Harne
             .iter_mut()
             .find(|change| change.path == incoming_change.path)
         {
+            if existing_change.added_lines == incoming_change.added_lines
+                && existing_change.removed_lines == incoming_change.removed_lines
+                && existing_change.unified_diff == incoming_change.unified_diff
+            {
+                continue;
+            }
+
             existing_change.added_lines += incoming_change.added_lines;
             existing_change.removed_lines += incoming_change.removed_lines;
             if let Some(diff) = incoming_change.unified_diff {
                 match &mut existing_change.unified_diff {
+                    Some(existing_diff) if existing_diff.contains(&diff) => {}
                     Some(existing_diff) if !existing_diff.is_empty() => {
                         existing_diff.push('\n');
                         existing_diff.push_str(&diff);
@@ -4733,11 +4741,12 @@ mod tests {
     use super::{
         ComposerQuery, FileMentionQuery, FileMentionSpan, SkillMentionQuery, SkillMentionSpan,
         complete_running_commands, format_file_mention, mask_skill_mentions,
+        merge_file_changes,
         parse_file_mention_spans, parse_file_mentions, parse_skill_mention_spans,
         sanitize_skill_mentions, tool_status_after_phase,
     };
     use crate::{
-        harness::{HarnessKind, HarnessRunStatus, HarnessThreadId, HarnessToolPhase},
+        harness::{HarnessFileChange, HarnessKind, HarnessRunStatus, HarnessThreadId, HarnessToolPhase},
         transcript::{HarnessThread, ToolDisplayKind, ToolStatus, TranscriptMessage, TranscriptRole},
     };
 
@@ -4890,6 +4899,34 @@ mod tests {
             } => assert_eq!(*status, ToolStatus::Running),
             _ => panic!("expected command tool message"),
         }
+    }
+
+    #[test]
+    fn skips_duplicate_file_change_snapshots() {
+        let mut merged = vec![HarnessFileChange {
+            path: "src/main.rs".into(),
+            added_lines: 3,
+            removed_lines: 1,
+            unified_diff: Some("@@ -1 +1 @@\n-old\n+new".to_string()),
+        }];
+
+        merge_file_changes(
+            &mut merged,
+            vec![HarnessFileChange {
+                path: "src/main.rs".into(),
+                added_lines: 3,
+                removed_lines: 1,
+                unified_diff: Some("@@ -1 +1 @@\n-old\n+new".to_string()),
+            }],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].added_lines, 3);
+        assert_eq!(merged[0].removed_lines, 1);
+        assert_eq!(
+            merged[0].unified_diff.as_deref(),
+            Some("@@ -1 +1 @@\n-old\n+new")
+        );
     }
 
     #[test]
