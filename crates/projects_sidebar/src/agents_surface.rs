@@ -1454,6 +1454,30 @@ fn merge_file_changes(existing: &mut Vec<HarnessFileChange>, incoming: Vec<Harne
                 continue;
             }
 
+            existing_change.added_lines = incoming_change.added_lines;
+            existing_change.removed_lines = incoming_change.removed_lines;
+            if let Some(diff) = incoming_change.unified_diff {
+                existing_change.unified_diff = Some(diff);
+            }
+        } else {
+            existing.push(incoming_change);
+        }
+    }
+}
+
+fn summarize_file_changes(existing: &mut Vec<HarnessFileChange>, incoming: Vec<HarnessFileChange>) {
+    for incoming_change in incoming {
+        if let Some(existing_change) = existing
+            .iter_mut()
+            .find(|change| change.path == incoming_change.path)
+        {
+            if existing_change.added_lines == incoming_change.added_lines
+                && existing_change.removed_lines == incoming_change.removed_lines
+                && existing_change.unified_diff == incoming_change.unified_diff
+            {
+                continue;
+            }
+
             existing_change.added_lines += incoming_change.added_lines;
             existing_change.removed_lines += incoming_change.removed_lines;
             if let Some(diff) = incoming_change.unified_diff {
@@ -1487,7 +1511,7 @@ fn latest_turn_file_changes(thread: &HarnessThread) -> Vec<HarnessFileChange> {
             ..
         } = &message.role
         {
-            merge_file_changes(&mut changes, message.file_changes.clone());
+            summarize_file_changes(&mut changes, message.file_changes.clone());
         }
     }
     changes
@@ -4740,8 +4764,8 @@ mod tests {
 
     use super::{
         ComposerQuery, FileMentionQuery, FileMentionSpan, SkillMentionQuery, SkillMentionSpan,
-        complete_running_commands, format_file_mention, mask_skill_mentions,
-        merge_file_changes,
+        complete_running_commands, format_file_mention, mask_skill_mentions, merge_file_changes,
+        summarize_file_changes,
         parse_file_mention_spans, parse_file_mentions, parse_skill_mention_spans,
         sanitize_skill_mentions, tool_status_after_phase,
     };
@@ -4926,6 +4950,62 @@ mod tests {
         assert_eq!(
             merged[0].unified_diff.as_deref(),
             Some("@@ -1 +1 @@\n-old\n+new")
+        );
+    }
+
+    #[test]
+    fn replaces_line_counts_for_updated_file_change_snapshots() {
+        let mut merged = vec![HarnessFileChange {
+            path: "src/main.rs".into(),
+            added_lines: 3,
+            removed_lines: 1,
+            unified_diff: Some("@@ -1 +1 @@\n-old\n+new".to_string()),
+        }];
+
+        merge_file_changes(
+            &mut merged,
+            vec![HarnessFileChange {
+                path: "src/main.rs".into(),
+                added_lines: 5,
+                removed_lines: 2,
+                unified_diff: Some("@@ -1 +1,2 @@\n-old\n+new\n+more".to_string()),
+            }],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].added_lines, 5);
+        assert_eq!(merged[0].removed_lines, 2);
+        assert_eq!(
+            merged[0].unified_diff.as_deref(),
+            Some("@@ -1 +1,2 @@\n-old\n+new\n+more")
+        );
+    }
+
+    #[test]
+    fn summary_merge_accumulates_separate_file_changes() {
+        let mut merged = vec![HarnessFileChange {
+            path: "src/main.rs".into(),
+            added_lines: 2,
+            removed_lines: 1,
+            unified_diff: Some("@@ -1 +1 @@\n-old\n+new".to_string()),
+        }];
+
+        summarize_file_changes(
+            &mut merged,
+            vec![HarnessFileChange {
+                path: "src/main.rs".into(),
+                added_lines: 4,
+                removed_lines: 0,
+                unified_diff: Some("@@ -10 +10,4 @@\n+extra".to_string()),
+            }],
+        );
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].added_lines, 6);
+        assert_eq!(merged[0].removed_lines, 1);
+        assert_eq!(
+            merged[0].unified_diff.as_deref(),
+            Some("@@ -1 +1 @@\n-old\n+new\n@@ -10 +10,4 @@\n+extra")
         );
     }
 
