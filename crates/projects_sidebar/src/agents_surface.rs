@@ -1614,12 +1614,14 @@ fn should_show_role_header(
     if matches!(message.role, TranscriptRole::Tool { .. }) {
         return true;
     }
-    // Scan backwards past intervening tool messages: an assistant message
-    // that follows another assistant's chunk (with tool calls in between)
-    // is part of the same Codex response, so suppress the duplicate label.
+    // Scan backwards past intervening tool and summary messages: an assistant
+    // message that follows another assistant's chunk is part of the same
+    // Codex response, even if a synthetic change summary was inserted after
+    // the turn finished.
     for prev in all[..index].iter().rev() {
         match (&message.role, &prev.role) {
             (TranscriptRole::Assistant, TranscriptRole::Tool { .. }) => continue,
+            (TranscriptRole::Assistant, TranscriptRole::ChangeSummary) => continue,
             (TranscriptRole::Assistant, TranscriptRole::Assistant) => return false,
             _ => return true,
         }
@@ -4764,7 +4766,7 @@ mod tests {
     use super::{
         ComposerQuery, FileMentionQuery, FileMentionSpan, SkillMentionQuery, SkillMentionSpan,
         complete_running_commands, format_file_mention, mask_skill_mentions, merge_file_changes,
-        summarize_file_changes,
+        should_show_role_header, summarize_file_changes,
         parse_file_mention_spans, parse_file_mentions, parse_skill_mention_spans,
         sanitize_skill_mentions, tool_status_after_phase,
     };
@@ -4922,6 +4924,17 @@ mod tests {
             } => assert_eq!(*status, ToolStatus::Running),
             _ => panic!("expected command tool message"),
         }
+    }
+
+    #[test]
+    fn suppresses_assistant_header_across_change_summary_messages() {
+        let messages = vec![
+            TranscriptMessage::new(TranscriptRole::Assistant, "first chunk".to_string()),
+            TranscriptMessage::new(TranscriptRole::ChangeSummary, String::new()),
+            TranscriptMessage::new(TranscriptRole::Assistant, "second chunk".to_string()),
+        ];
+
+        assert!(!should_show_role_header(2, &messages[2], &messages));
     }
 
     #[test]
