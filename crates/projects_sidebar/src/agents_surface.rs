@@ -996,6 +996,46 @@ fn resolve_file_mention_spans(
         .collect()
 }
 
+fn build_replay_context(messages: &[TranscriptMessage], path_style: util::paths::PathStyle) -> Option<String> {
+    let pending_user_index = messages
+        .iter()
+        .rposition(|message| matches!(message.role, TranscriptRole::User))
+        .filter(|index| *index == messages.len().saturating_sub(1))?;
+
+    let mut sections = Vec::new();
+    for message in &messages[..pending_user_index] {
+        match message.role {
+            TranscriptRole::User => {
+                let text = sanitize_skill_mentions(&message.text, path_style);
+                let combined = build_input_with_attachments(&text, &message.attachments);
+                if !combined.trim().is_empty() {
+                    sections.push(format!("User:\n{combined}"));
+                }
+            }
+            TranscriptRole::Assistant => {
+                if !message.text.trim().is_empty() {
+                    sections.push(format!("Assistant:\n{}", message.text));
+                }
+            }
+            TranscriptRole::System => {
+                if !message.text.trim().is_empty() {
+                    sections.push(format!("System:\n{}", message.text));
+                }
+            }
+            TranscriptRole::ChangeSummary | TranscriptRole::Tool { .. } => {}
+        }
+    }
+
+    if sections.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Prior local thread context (replayed because the provider thread had to be restored):\n\n{}\n\nContinue from that restored context.",
+            sections.join("\n\n")
+        ))
+    }
+}
+
 fn mention_display_path(
     workspace: &Entity<workspace::Workspace>,
     path_match: &PathMatch,
@@ -3495,6 +3535,10 @@ impl AgentsSurface {
         let config = HarnessSessionConfig {
             thread_id: thread_id.clone(),
             provider_thread_id: thread.provider_thread_id.clone(),
+            replay_context: build_replay_context(
+                &thread.messages,
+                self.workspace.read(cx).path_style(cx),
+            ),
             cwd: thread.cwd.clone(),
             executor: cx.background_executor().clone(),
             model: self.selected_model.clone(),
@@ -4766,7 +4810,8 @@ mod tests {
 
     use super::{
         ComposerQuery, FileMentionQuery, FileMentionSpan, SkillMentionQuery, SkillMentionSpan,
-        apply_token_usage, complete_running_commands, context_usage_indicator_color,
+        apply_token_usage, build_replay_context, complete_running_commands,
+        context_usage_indicator_color,
         format_file_mention, mask_skill_mentions, merge_file_changes,
         parse_file_mention_spans, parse_file_mentions, parse_skill_mention_spans,
         sanitize_skill_mentions, should_show_role_header, summarize_file_changes,
@@ -4820,6 +4865,25 @@ mod tests {
         assert_eq!(context_usage_indicator_color(60), Color::Warning);
         assert_eq!(context_usage_indicator_color(79), Color::Warning);
         assert_eq!(context_usage_indicator_color(80), Color::Error);
+    }
+
+    #[test]
+    fn builds_replay_context_from_prior_local_messages() {
+        let mut first_user = TranscriptMessage::new(TranscriptRole::User, "hey".to_string());
+        first_user.attachments.push("/tmp/note.txt".into());
+
+        let messages = vec![
+            first_user,
+            TranscriptMessage::new(TranscriptRole::Assistant, "hello".to_string()),
+            TranscriptMessage::new(TranscriptRole::User, "what's up?".to_string()),
+        ];
+
+        assert_eq!(
+            build_replay_context(&messages, PathStyle::local()).as_deref(),
+            Some(
+                "Prior local thread context (replayed because the provider thread had to be restored):\n\nUser:\nhey\n\nAttached files:\n- /tmp/note.txt\n\nAssistant:\nhello\n\nContinue from that restored context."
+            )
+        );
     }
 
     #[test]

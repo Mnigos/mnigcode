@@ -2,6 +2,9 @@ use gpui::{
     AnyElement, AnyView, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
     PathPromptOptions, Pixels, Render, SharedString, Subscription, Task, WeakEntity, Window, px,
 };
+use gpui::{
+    prelude::*,
+};
 use std::{collections::HashSet, path::PathBuf, time::Duration};
 use ui::{CommonAnimationExt, Tooltip, prelude::*};
 use workspace::{
@@ -862,10 +865,12 @@ impl Render for ProjectsSidebar {
             )
             .child(self.render_add_project_row(cx))
             .child(
-                v_flex()
-                    .gap_2()
-                    .overflow_hidden()
-                    .children(project_elements),
+                div()
+                    .id("projects-sidebar-scroll-container")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(v_flex().gap_2().children(project_elements)),
             )
     }
 }

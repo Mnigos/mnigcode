@@ -82,6 +82,7 @@ impl HarnessSandboxPolicy {
 pub struct HarnessSessionConfig {
     pub thread_id: HarnessThreadId,
     pub provider_thread_id: Option<String>,
+    pub replay_context: Option<String>,
     pub cwd: PathBuf,
     pub executor: BackgroundExecutor,
     pub model: String,
@@ -440,6 +441,7 @@ async fn start_turn_without_killing<Reader, Writer>(
     config: &HarnessSessionConfig,
     updates: &Sender<HarnessTurnUpdate>,
     provider_thread_id: &str,
+    replay_context: Option<&str>,
     turn: &HarnessTurnInput,
 ) -> Result<()>
 where
@@ -449,7 +451,7 @@ where
     let request_id = next_app_server_request_id(next_request_id);
     write_message(
         writer,
-        turn_start_message(request_id, config, provider_thread_id, turn),
+        turn_start_message(request_id, config, provider_thread_id, replay_context, turn),
     )
     .await?;
     await_app_server_response_without_killing(
@@ -527,11 +529,13 @@ fn turn_start_message(
     request_id: i64,
     config: &HarnessSessionConfig,
     provider_thread_id: &str,
+    replay_context: Option<&str>,
     turn: &HarnessTurnInput,
 ) -> Value {
+    let input_text = replayed_turn_input_text(replay_context, &turn.input);
     let mut input = vec![json!({
         "type": "text",
-        "text": turn.input.as_str(),
+        "text": input_text,
         "text_elements": [],
     })];
     input.extend(turn.skill_mentions.iter().map(|skill| {
@@ -555,6 +559,14 @@ fn turn_start_message(
             "sandboxPolicy": sandbox_policy_value(&turn.sandbox_policy),
         },
     })
+}
+
+fn replayed_turn_input_text(replay_context: Option<&str>, input: &str) -> String {
+    replay_context
+        .map(|replay_context| {
+            format!("{replay_context}\n\nCurrent user message:\n{input}")
+        })
+        .unwrap_or_else(|| input.to_string())
 }
 
 fn is_thread_not_found_error(error: &anyhow::Error) -> bool {
@@ -703,6 +715,7 @@ async fn run_codex_app_server_session_impl(
     };
     let mut provider_thread_id = opened_thread.provider_thread_id;
     let mut raw_session_path = opened_thread.raw_session_path;
+    let mut should_replay_context = config.provider_thread_id.is_none();
 
     while let Ok(turn) = turns.recv().await {
         send_status(
@@ -719,11 +732,16 @@ async fn run_codex_app_server_session_impl(
             &config,
             updates,
             &provider_thread_id,
+            should_replay_context
+                .then_some(config.replay_context.as_deref())
+                .flatten(),
             &turn,
         )
         .await
         {
-            Ok(()) => {}
+            Ok(()) => {
+                should_replay_context = false;
+            }
             Err(error) if is_thread_not_found_error(&error) => {
                 let opened_thread = start_codex_thread(
                     &mut reader,
@@ -736,6 +754,7 @@ async fn run_codex_app_server_session_impl(
                 .await?;
                 provider_thread_id = opened_thread.provider_thread_id;
                 raw_session_path = opened_thread.raw_session_path;
+                should_replay_context = config.replay_context.is_some();
                 if let Err(error) = start_turn_without_killing(
                     &mut reader,
                     &mut writer,
@@ -743,6 +762,9 @@ async fn run_codex_app_server_session_impl(
                     &config,
                     updates,
                     &provider_thread_id,
+                    should_replay_context
+                        .then_some(config.replay_context.as_deref())
+                        .flatten(),
                     &turn,
                 )
                 .await
@@ -750,6 +772,7 @@ async fn run_codex_app_server_session_impl(
                     child.kill().ok();
                     return Err(error);
                 }
+                should_replay_context = false;
             }
             Err(error) => {
                 child.kill().ok();
@@ -2300,6 +2323,7 @@ mod tests {
         extract_thread_token_usage, finalize_partial_command_record, handle_notification,
         handle_parsed_command_event, is_thread_not_found_message, opened_thread_from_result,
         parse_raw_session_command_event, parse_tool_event, read_new_session_lines,
+        replayed_turn_input_text,
     };
     use gpui::SharedString;
 
@@ -2782,6 +2806,14 @@ mod tests {
                 other => panic!("unexpected update: {other:?}"),
             }
         });
+    }
+
+    #[test]
+    fn replayed_turn_input_text_includes_replayed_context() {
+        assert_eq!(
+            replayed_turn_input_text(Some("User:\nhey"), "what's up?"),
+            "User:\nhey\n\nCurrent user message:\nwhat's up?"
+        );
     }
 
     #[test]
