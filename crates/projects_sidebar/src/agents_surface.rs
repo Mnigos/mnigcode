@@ -1380,6 +1380,16 @@ fn apply_token_usage(
     }
 }
 
+fn context_usage_indicator_color(percentage: u32) -> Color {
+    if percentage >= 80 {
+        Color::Error
+    } else if percentage >= 60 {
+        Color::Warning
+    } else {
+        Color::Info
+    }
+}
+
 fn complete_running_commands(thread: &mut HarnessThread, except_item_id: Option<&str>) {
     for message in &mut thread.messages {
         let TranscriptRole::Tool {
@@ -4586,11 +4596,7 @@ impl AgentsSurface {
         let percentage = (ratio * 100.0).ceil().min(100.0) as u32;
         let used_label = format_token_count(tokens_used);
         let max_label = format_token_count(max_token_count);
-        let bar_color = if percentage >= 85 {
-            cx.theme().status().warning
-        } else {
-            cx.theme().status().info
-        };
+        let bar_color = context_usage_indicator_color(percentage).color(cx);
         // Ensure the progress arc is visually perceptible even when usage is
         // still a tiny fraction of the window (new threads, first tokens).
         let display_value = (ratio.max(0.03) * max_tokens).min(max_tokens);
@@ -4755,14 +4761,16 @@ impl EventEmitter<AgentsSurfaceEvent> for AgentsSurface {}
 
 #[cfg(test)]
 mod tests {
+    use ui::Color;
     use util::paths::PathStyle;
 
     use super::{
         ComposerQuery, FileMentionQuery, FileMentionSpan, SkillMentionQuery, SkillMentionSpan,
-        apply_token_usage, complete_running_commands, format_file_mention, mask_skill_mentions,
-        merge_file_changes, parse_file_mention_spans, parse_file_mentions,
-        parse_skill_mention_spans, sanitize_skill_mentions, should_show_role_header,
-        summarize_file_changes, tool_status_after_phase,
+        apply_token_usage, complete_running_commands, context_usage_indicator_color,
+        format_file_mention, mask_skill_mentions, merge_file_changes,
+        parse_file_mention_spans, parse_file_mentions, parse_skill_mention_spans,
+        sanitize_skill_mentions, should_show_role_header, summarize_file_changes,
+        tool_status_after_phase,
     };
     use crate::{
         harness::{
@@ -4804,6 +4812,14 @@ mod tests {
 
         assert_eq!(thread.tokens_used, 900);
         assert_eq!(thread.model_context_window, Some(256_000));
+    }
+
+    #[test]
+    fn context_indicator_uses_warning_and_error_thresholds() {
+        assert_eq!(context_usage_indicator_color(59), Color::Info);
+        assert_eq!(context_usage_indicator_color(60), Color::Warning);
+        assert_eq!(context_usage_indicator_color(79), Color::Warning);
+        assert_eq!(context_usage_indicator_color(80), Color::Error);
     }
 
     #[test]

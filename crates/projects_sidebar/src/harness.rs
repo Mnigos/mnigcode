@@ -105,6 +105,11 @@ pub struct HarnessSkillMention {
     pub path: PathBuf,
 }
 
+struct OpenedThread {
+    provider_thread_id: String,
+    raw_session_path: Option<PathBuf>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HarnessSkillDefinition {
     pub name: SharedString,
@@ -346,7 +351,24 @@ async fn await_app_server_response<Fut, T>(
 where
     Fut: Future<Output = Result<T>>,
 {
-    match smol::future::or(future, async {
+    match await_app_server_response_without_killing(executor, description, future).await {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            child.kill().ok();
+            Err(error)
+        }
+    }
+}
+
+async fn await_app_server_response_without_killing<Fut, T>(
+    executor: &BackgroundExecutor,
+    description: &'static str,
+    future: Fut,
+) -> Result<T>
+where
+    Fut: Future<Output = Result<T>>,
+{
+    smol::future::or(future, async {
         executor.timer(APP_SERVER_RESPONSE_TIMEOUT).await;
         Err(anyhow!(
             "timed out waiting for codex app-server {description} after {:?}",
@@ -354,13 +376,198 @@ where
         ))
     })
     .await
-    {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            child.kill().ok();
-            Err(error)
-        }
-    }
+}
+
+async fn start_codex_thread<Reader, Writer>(
+    reader: &mut BufReader<Reader>,
+    writer: &mut BufWriter<Writer>,
+    child: &mut smol::process::Child,
+    next_request_id: &mut i64,
+    config: &HarnessSessionConfig,
+    updates: &Sender<HarnessTurnUpdate>,
+) -> Result<OpenedThread>
+where
+    Reader: AsyncRead + Unpin,
+    Writer: AsyncWrite + Unpin,
+{
+    let request_id = next_app_server_request_id(next_request_id);
+    write_message(writer, thread_start_message(request_id, config)).await?;
+    let result = await_app_server_response(
+        child,
+        &config.executor,
+        "thread start response",
+        read_until_response(reader, writer, request_id, &config.thread_id, updates),
+    )
+    .await?;
+    let opened_thread = opened_thread_from_result(&result, None)?;
+    send_thread_ready(updates, config.thread_id.clone(), &opened_thread).await;
+    Ok(opened_thread)
+}
+
+async fn resume_codex_thread<Reader, Writer>(
+    reader: &mut BufReader<Reader>,
+    writer: &mut BufWriter<Writer>,
+    next_request_id: &mut i64,
+    config: &HarnessSessionConfig,
+    updates: &Sender<HarnessTurnUpdate>,
+    provider_thread_id: &str,
+) -> Result<OpenedThread>
+where
+    Reader: AsyncRead + Unpin,
+    Writer: AsyncWrite + Unpin,
+{
+    let request_id = next_app_server_request_id(next_request_id);
+    write_message(
+        writer,
+        thread_resume_message(request_id, config, provider_thread_id),
+    )
+    .await?;
+    let result = await_app_server_response_without_killing(
+        &config.executor,
+        "thread resume response",
+        read_until_response(reader, writer, request_id, &config.thread_id, updates),
+    )
+    .await?;
+    let opened_thread = opened_thread_from_result(&result, Some(provider_thread_id))?;
+    send_thread_ready(updates, config.thread_id.clone(), &opened_thread).await;
+    Ok(opened_thread)
+}
+
+async fn start_turn_without_killing<Reader, Writer>(
+    reader: &mut BufReader<Reader>,
+    writer: &mut BufWriter<Writer>,
+    next_request_id: &mut i64,
+    config: &HarnessSessionConfig,
+    updates: &Sender<HarnessTurnUpdate>,
+    provider_thread_id: &str,
+    turn: &HarnessTurnInput,
+) -> Result<()>
+where
+    Reader: AsyncRead + Unpin,
+    Writer: AsyncWrite + Unpin,
+{
+    let request_id = next_app_server_request_id(next_request_id);
+    write_message(
+        writer,
+        turn_start_message(request_id, config, provider_thread_id, turn),
+    )
+    .await?;
+    await_app_server_response_without_killing(
+        &config.executor,
+        "turn/start response",
+        read_until_response(reader, writer, request_id, &config.thread_id, updates),
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn send_thread_ready(
+    updates: &Sender<HarnessTurnUpdate>,
+    thread_id: HarnessThreadId,
+    opened_thread: &OpenedThread,
+) {
+    send_update(
+        updates,
+        HarnessTurnUpdate::ThreadReady {
+            thread_id,
+            provider_thread_id: opened_thread.provider_thread_id.clone(),
+        },
+    )
+    .await;
+}
+
+fn opened_thread_from_result(
+    result: &Value,
+    provider_thread_id_fallback: Option<&str>,
+) -> Result<OpenedThread> {
+    let provider_thread_id = read_thread_id(result)
+        .or_else(|| provider_thread_id_fallback.map(ToString::to_string))
+        .context("codex app-server did not return a thread id")?;
+
+    Ok(OpenedThread {
+        provider_thread_id,
+        raw_session_path: read_thread_path(result),
+    })
+}
+
+fn thread_start_message(request_id: i64, config: &HarnessSessionConfig) -> Value {
+    json!({
+        "method": "thread/start",
+        "id": request_id,
+        "params": {
+            "cwd": config.cwd.to_string_lossy(),
+            "model": config.model.as_str(),
+            "approvalPolicy": approval_policy_name(&config.approval_policy),
+            "sandboxPolicy": sandbox_policy_value(&config.sandbox_policy),
+            "serviceName": "mnig_code",
+        },
+    })
+}
+
+fn thread_resume_message(
+    request_id: i64,
+    config: &HarnessSessionConfig,
+    provider_thread_id: &str,
+) -> Value {
+    json!({
+        "method": "thread/resume",
+        "id": request_id,
+        "params": {
+            "threadId": provider_thread_id,
+            "cwd": config.cwd.to_string_lossy(),
+            "model": config.model.as_str(),
+            "approvalPolicy": approval_policy_name(&config.approval_policy),
+            "sandboxPolicy": sandbox_policy_value(&config.sandbox_policy),
+            "serviceName": "mnig_code",
+        },
+    })
+}
+
+fn turn_start_message(
+    request_id: i64,
+    config: &HarnessSessionConfig,
+    provider_thread_id: &str,
+    turn: &HarnessTurnInput,
+) -> Value {
+    let mut input = vec![json!({
+        "type": "text",
+        "text": turn.input.as_str(),
+        "text_elements": [],
+    })];
+    input.extend(turn.skill_mentions.iter().map(|skill| {
+        json!({
+            "type": "skill",
+            "name": skill.name.as_str(),
+            "path": skill.path.to_string_lossy().to_string(),
+        })
+    }));
+
+    json!({
+        "method": "turn/start",
+        "id": request_id,
+        "params": {
+            "threadId": provider_thread_id,
+            "input": input,
+            "cwd": config.cwd.to_string_lossy(),
+            "model": turn.model.as_str(),
+            "effort": turn.reasoning_effort.as_str(),
+            "approvalPolicy": approval_policy_name(&turn.approval_policy),
+            "sandboxPolicy": sandbox_policy_value(&turn.sandbox_policy),
+        },
+    })
+}
+
+fn is_thread_not_found_error(error: &anyhow::Error) -> bool {
+    is_thread_not_found_message(&error.to_string())
+}
+
+fn is_thread_not_found_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("thread")
+        && (message.contains("not found")
+            || message.contains("cannot be found")
+            || message.contains("could not be found")
+            || message.contains("no rollout found"))
 }
 
 async fn run_codex_app_server_session_impl(
@@ -455,61 +662,47 @@ async fn run_codex_app_server_session_impl(
     )
     .await?;
 
-    let thread_open_id = next_request_id;
-    next_request_id += 1;
-    let thread_open_message = if let Some(provider_thread_id) = config.provider_thread_id.clone() {
-        json!({
-            "method": "thread/resume",
-            "id": thread_open_id,
-            "params": {
-                "threadId": provider_thread_id,
-                "cwd": config.cwd.to_string_lossy(),
-                "model": config.model,
-                "approvalPolicy": approval_policy_name(&config.approval_policy),
-                "sandboxPolicy": sandbox_policy_value(&config.sandbox_policy),
-                "serviceName": "mnig_code",
-            },
-        })
-    } else {
-        json!({
-            "method": "thread/start",
-            "id": thread_open_id,
-            "params": {
-                "cwd": config.cwd.to_string_lossy(),
-                "model": config.model,
-                "approvalPolicy": approval_policy_name(&config.approval_policy),
-                "sandboxPolicy": sandbox_policy_value(&config.sandbox_policy),
-                "serviceName": "mnig_code",
-            },
-        })
-    };
-    write_message(&mut writer, thread_open_message).await?;
-    let thread_open_result = await_app_server_response(
-        &mut child,
-        &config.executor,
-        "thread open response",
-        read_until_response(
+    let opened_thread = if let Some(provider_thread_id) = config.provider_thread_id.as_deref() {
+        match resume_codex_thread(
             &mut reader,
             &mut writer,
-            thread_open_id,
-            &config.thread_id,
+            &mut next_request_id,
+            &config,
             updates,
-        ),
-    )
-    .await?;
-    let provider_thread_id = read_thread_id(&thread_open_result)
-        .or(config.provider_thread_id.clone())
-        .context("codex app-server did not return a thread id")?;
-    let raw_session_path = read_thread_path(&thread_open_result);
-
-    send_update(
-        updates,
-        HarnessTurnUpdate::ThreadReady {
-            thread_id: config.thread_id.clone(),
-            provider_thread_id: provider_thread_id.clone(),
-        },
-    )
-    .await;
+            provider_thread_id,
+        )
+        .await
+        {
+            Ok(opened_thread) => opened_thread,
+            Err(error) if is_thread_not_found_error(&error) => {
+                start_codex_thread(
+                    &mut reader,
+                    &mut writer,
+                    &mut child,
+                    &mut next_request_id,
+                    &config,
+                    updates,
+                )
+                .await?
+            }
+            Err(error) => {
+                child.kill().ok();
+                return Err(error);
+            }
+        }
+    } else {
+        start_codex_thread(
+            &mut reader,
+            &mut writer,
+            &mut child,
+            &mut next_request_id,
+            &config,
+            updates,
+        )
+        .await?
+    };
+    let mut provider_thread_id = opened_thread.provider_thread_id;
+    let mut raw_session_path = opened_thread.raw_session_path;
 
     while let Ok(turn) = turns.recv().await {
         send_status(
@@ -519,51 +712,50 @@ async fn run_codex_app_server_session_impl(
         )
         .await;
 
-        let turn_start_id = next_request_id;
-        next_request_id += 1;
-        let mut input = vec![json!({
-            "type": "text",
-            "text": turn.input,
-            "text_elements": [],
-        })];
-        input.extend(turn.skill_mentions.into_iter().map(|skill| {
-            json!({
-                "type": "skill",
-                "name": skill.name,
-                "path": skill.path.to_string_lossy(),
-            })
-        }));
-
-        write_message(
+        match start_turn_without_killing(
+            &mut reader,
             &mut writer,
-            json!({
-                "method": "turn/start",
-                "id": turn_start_id,
-                "params": {
-                    "threadId": provider_thread_id,
-                    "input": input,
-                    "cwd": config.cwd.to_string_lossy(),
-                    "model": turn.model,
-                    "effort": turn.reasoning_effort,
-                    "approvalPolicy": approval_policy_name(&turn.approval_policy),
-                    "sandboxPolicy": sandbox_policy_value(&turn.sandbox_policy),
-                },
-            }),
+            &mut next_request_id,
+            &config,
+            updates,
+            &provider_thread_id,
+            &turn,
         )
-        .await?;
-        await_app_server_response(
-            &mut child,
-            &config.executor,
-            "turn/start response",
-            read_until_response(
-                &mut reader,
-                &mut writer,
-                turn_start_id,
-                &config.thread_id,
-                updates,
-            ),
-        )
-        .await?;
+        .await
+        {
+            Ok(()) => {}
+            Err(error) if is_thread_not_found_error(&error) => {
+                let opened_thread = start_codex_thread(
+                    &mut reader,
+                    &mut writer,
+                    &mut child,
+                    &mut next_request_id,
+                    &config,
+                    updates,
+                )
+                .await?;
+                provider_thread_id = opened_thread.provider_thread_id;
+                raw_session_path = opened_thread.raw_session_path;
+                if let Err(error) = start_turn_without_killing(
+                    &mut reader,
+                    &mut writer,
+                    &mut next_request_id,
+                    &config,
+                    updates,
+                    &provider_thread_id,
+                    &turn,
+                )
+                .await
+                {
+                    child.kill().ok();
+                    return Err(error);
+                }
+            }
+            Err(error) => {
+                child.kill().ok();
+                return Err(error);
+            }
+        }
         send_status(updates, config.thread_id.clone(), HarnessRunStatus::Running).await;
 
         let raw_session_stream = if let Some(path) = raw_session_path.as_ref() {
@@ -1464,12 +1656,19 @@ enum RawSessionCommandEvent {
     Started {
         call_id: String,
         tool_name: String,
+        title: SharedString,
     },
     Completed {
         call_id: String,
         tool_name: Option<String>,
+        title: SharedString,
         output: String,
     },
+}
+
+struct PendingRawSessionCommand {
+    tool_name: String,
+    title: SharedString,
 }
 
 async fn stream_exec_command_outputs_from_session(
@@ -1480,7 +1679,7 @@ async fn stream_exec_command_outputs_from_session(
     updates: Sender<HarnessTurnUpdate>,
     stop: Receiver<()>,
 ) {
-    let mut pending_tool_names = HashMap::new();
+    let mut pending_commands = HashMap::new();
     let mut partial = Vec::new();
 
     loop {
@@ -1490,7 +1689,7 @@ async fn stream_exec_command_outputs_from_session(
             &mut offset,
             &thread_id,
             &updates,
-            &mut pending_tool_names,
+            &mut pending_commands,
             &mut partial,
         )
         .await;
@@ -1498,7 +1697,7 @@ async fn stream_exec_command_outputs_from_session(
             finalize_partial_command_record(
                 &thread_id,
                 &updates,
-                &mut pending_tool_names,
+                &mut pending_commands,
                 &mut partial,
             )
             .await;
@@ -1512,14 +1711,14 @@ async fn stream_exec_command_outputs_from_session(
                 &mut offset,
                 &thread_id,
                 &updates,
-                &mut pending_tool_names,
+                &mut pending_commands,
                 &mut partial,
             )
             .await;
             finalize_partial_command_record(
                 &thread_id,
                 &updates,
-                &mut pending_tool_names,
+                &mut pending_commands,
                 &mut partial,
             )
             .await;
@@ -1533,7 +1732,7 @@ async fn drain_new_session_lines(
     offset: &mut u64,
     thread_id: &HarnessThreadId,
     updates: &Sender<HarnessTurnUpdate>,
-    pending_tool_names: &mut HashMap<String, String>,
+    pending_commands: &mut HashMap<String, PendingRawSessionCommand>,
     partial: &mut Vec<u8>,
 ) {
     let session_path = session_path.to_path_buf();
@@ -1556,7 +1755,7 @@ async fn drain_new_session_lines(
                 }
 
                 if let Some(event) = parse_raw_session_command_event(line) {
-                    handle_parsed_command_event(event, thread_id, updates, pending_tool_names)
+                    handle_parsed_command_event(event, thread_id, updates, pending_commands)
                         .await;
                 }
             }
@@ -1574,7 +1773,7 @@ async fn drain_new_session_lines(
 async fn finalize_partial_command_record(
     thread_id: &HarnessThreadId,
     updates: &Sender<HarnessTurnUpdate>,
-    pending_tool_names: &mut HashMap<String, String>,
+    pending_commands: &mut HashMap<String, PendingRawSessionCommand>,
     partial: &mut Vec<u8>,
 ) {
     if partial.is_empty() {
@@ -1582,7 +1781,7 @@ async fn finalize_partial_command_record(
     }
 
     if let Some(event) = parse_raw_session_command_event(partial.as_slice()) {
-        handle_parsed_command_event(event, thread_id, updates, pending_tool_names).await;
+        handle_parsed_command_event(event, thread_id, updates, pending_commands).await;
     }
     partial.clear();
 }
@@ -1591,21 +1790,36 @@ async fn handle_parsed_command_event(
     event: RawSessionCommandEvent,
     thread_id: &HarnessThreadId,
     updates: &Sender<HarnessTurnUpdate>,
-    pending_tool_names: &mut HashMap<String, String>,
+    pending_commands: &mut HashMap<String, PendingRawSessionCommand>,
 ) {
     match event {
-        RawSessionCommandEvent::Started { call_id, tool_name } => {
-            pending_tool_names.insert(call_id, tool_name);
+        RawSessionCommandEvent::Started {
+            call_id,
+            tool_name,
+            title,
+        } => {
+            pending_commands.insert(call_id, PendingRawSessionCommand { tool_name, title });
         }
         RawSessionCommandEvent::Completed {
             call_id,
             tool_name,
+            title,
             output,
         } => {
-            let pending_tool_name = pending_tool_names.remove(&call_id);
-            if pending_tool_name.as_deref() == Some("exec_command")
+            let pending_command = pending_commands.remove(&call_id);
+            if pending_command
+                .as_ref()
+                .map(|command| command.tool_name.as_str())
+                == Some("exec_command")
                 || tool_name.as_deref() == Some("exec_command")
             {
+                let title = if title.is_empty() {
+                    pending_command
+                        .map(|command| command.title)
+                        .unwrap_or_default()
+                } else {
+                    title
+                };
                 send_update(
                     updates,
                     HarnessTurnUpdate::ToolEvent {
@@ -1613,7 +1827,7 @@ async fn handle_parsed_command_event(
                         item_id: Some(call_id),
                         kind: HarnessToolKind::Command,
                         phase: HarnessToolPhase::End,
-                        title: SharedString::default(),
+                        title,
                         detail: output.into(),
                         file_changes: Vec::new(),
                     },
@@ -1653,6 +1867,7 @@ fn parse_raw_session_command_event(line: &[u8]) -> Option<RawSessionCommandEvent
             Some(RawSessionCommandEvent::Started {
                 call_id: payload.get("call_id").and_then(Value::as_str)?.to_string(),
                 tool_name: payload.get("name").and_then(Value::as_str)?.to_string(),
+                title: raw_session_command_title(payload),
             })
         }
         "response_item"
@@ -1664,6 +1879,7 @@ fn parse_raw_session_command_event(line: &[u8]) -> Option<RawSessionCommandEvent
                     .get("name")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                title: SharedString::default(),
                 output: extract_exec_command_output(
                     payload.get("output").and_then(Value::as_str)?,
                 )?,
@@ -1704,11 +1920,44 @@ fn parse_raw_session_command_event(line: &[u8]) -> Option<RawSessionCommandEvent
             Some(RawSessionCommandEvent::Completed {
                 call_id: payload.get("call_id").and_then(Value::as_str)?.to_string(),
                 tool_name: Some("exec_command".to_string()),
+                title: raw_session_command_title(payload),
                 output,
             })
         }
         _ => None,
     }
+}
+
+fn raw_session_command_title(payload: &Value) -> SharedString {
+    let Some(command) = raw_session_command_text(payload) else {
+        return SharedString::default();
+    };
+
+    let command = command.lines().next().unwrap_or("").trim();
+    if command.is_empty() {
+        SharedString::default()
+    } else {
+        format!("Run command: {command}").into()
+    }
+}
+
+fn raw_session_command_text(payload: &Value) -> Option<String> {
+    if let Some(command) = command_string(payload, None) {
+        return Some(command);
+    }
+
+    let arguments = payload.get("arguments")?;
+    let arguments = match arguments {
+        Value::String(arguments) => serde_json::from_str::<Value>(arguments).ok()?,
+        Value::Object(_) => arguments.clone(),
+        _ => return None,
+    };
+
+    arguments
+        .get("cmd")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| command_string(&arguments, None))
 }
 
 fn extract_exec_command_output(output: &str) -> Option<String> {
@@ -2047,10 +2296,12 @@ mod tests {
 
     use super::{
         HarnessThreadId, HarnessTokenUsageSource, HarnessToolKind, HarnessTurnUpdate,
-        RawSessionCommandEvent, extract_exec_command_output, extract_thread_token_usage,
-        finalize_partial_command_record, handle_notification, parse_raw_session_command_event,
-        parse_tool_event, read_new_session_lines,
+        PendingRawSessionCommand, RawSessionCommandEvent, extract_exec_command_output,
+        extract_thread_token_usage, finalize_partial_command_record, handle_notification,
+        handle_parsed_command_event, is_thread_not_found_message, opened_thread_from_result,
+        parse_raw_session_command_event, parse_tool_event, read_new_session_lines,
     };
+    use gpui::SharedString;
 
     #[test]
     fn formats_mcp_tool_arguments_as_fields() {
@@ -2255,10 +2506,12 @@ mod tests {
             RawSessionCommandEvent::Completed {
                 call_id,
                 tool_name,
+                title,
                 output,
             } => {
                 assert_eq!(call_id, "call_123");
                 assert_eq!(tool_name, None);
+                assert!(title.is_empty());
                 assert_eq!(output, "hello\nworld");
             }
             RawSessionCommandEvent::Started { .. } => panic!("expected completed event"),
@@ -2266,8 +2519,28 @@ mod tests {
     }
 
     #[test]
+    fn parses_exec_command_start_title_from_raw_session_response_item() {
+        let line = br#"{"timestamp":"2026-04-21T20:00:54.000Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"px wrangler deploy\",\"workdir\":\"/tmp/project\"}","call_id":"call_123"}}"#;
+
+        let event = parse_raw_session_command_event(line).unwrap();
+
+        match event {
+            RawSessionCommandEvent::Started {
+                call_id,
+                tool_name,
+                title,
+            } => {
+                assert_eq!(call_id, "call_123");
+                assert_eq!(tool_name, "exec_command");
+                assert_eq!(title.as_ref(), "Run command: px wrangler deploy");
+            }
+            RawSessionCommandEvent::Completed { .. } => panic!("expected started event"),
+        }
+    }
+
+    #[test]
     fn parses_exec_command_end_output_from_raw_session_event() {
-        let line = br#"{"timestamp":"2026-04-21T20:06:06.945Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_456","aggregated_output":"hello\nworld\n","formatted_output":"","stdout":"","stderr":"","status":"completed"}}"#;
+        let line = br#"{"timestamp":"2026-04-21T20:06:06.945Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_456","command":["px","wrangler","deploy"],"aggregated_output":"hello\nworld\n","formatted_output":"","stdout":"","stderr":"","status":"completed"}}"#;
 
         let event = parse_raw_session_command_event(line).unwrap();
 
@@ -2275,10 +2548,12 @@ mod tests {
             RawSessionCommandEvent::Completed {
                 call_id,
                 tool_name,
+                title,
                 output,
             } => {
                 assert_eq!(call_id, "call_456");
                 assert_eq!(tool_name.as_deref(), Some("exec_command"));
+                assert_eq!(title.as_ref(), "Run command: px wrangler deploy");
                 assert_eq!(output, "hello\nworld\n");
             }
             RawSessionCommandEvent::Started { .. } => panic!("expected completed event"),
@@ -2331,6 +2606,41 @@ mod tests {
             assert_eq!(error.to_string(), "turn exploded");
             assert!(updates_rx.try_recv().is_err());
         });
+    }
+
+    #[test]
+    fn detects_thread_not_found_errors() {
+        assert!(is_thread_not_found_message("Thread not found"));
+        assert!(is_thread_not_found_message(
+            "codex error: thread abc was not found"
+        ));
+        assert!(is_thread_not_found_message("thread cannot be found"));
+        assert!(is_thread_not_found_message(
+            "no rollout found for thread id 019db934-7c03-7e62-b09b-5796dbbc957a"
+        ));
+        assert!(!is_thread_not_found_message(
+            "turn failed before responding"
+        ));
+    }
+
+    #[test]
+    fn opened_thread_uses_fresh_thread_id_when_returned() {
+        let opened_thread = opened_thread_from_result(
+            &json!({
+                "thread": {
+                    "id": "fresh-thread",
+                    "path": "/tmp/fresh-thread.jsonl"
+                }
+            }),
+            Some("stale-thread"),
+        )
+        .unwrap();
+
+        assert_eq!(opened_thread.provider_thread_id, "fresh-thread");
+        assert_eq!(
+            opened_thread.raw_session_path.as_deref(),
+            Some(std::path::Path::new("/tmp/fresh-thread.jsonl"))
+        );
     }
 
     #[test]
@@ -2478,13 +2788,13 @@ mod tests {
     fn finalizes_partial_command_record_without_newline() {
         smol::block_on(async {
             let (updates_tx, updates_rx) = channel::unbounded();
-            let mut pending_tool_names = std::collections::HashMap::new();
-            let mut partial = br#"{"timestamp":"2026-04-21T20:06:06.945Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_456","aggregated_output":"hello\nworld\n","formatted_output":"","stdout":"","stderr":"","status":"completed"}}"#.to_vec();
+            let mut pending_commands = std::collections::HashMap::new();
+            let mut partial = br#"{"timestamp":"2026-04-21T20:06:06.945Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"call_456","command":["px","wrangler","deploy"],"aggregated_output":"hello\nworld\n","formatted_output":"","stdout":"","stderr":"","status":"completed"}}"#.to_vec();
 
             finalize_partial_command_record(
                 &super::HarnessThreadId("thread-1".into()),
                 &updates_tx,
-                &mut pending_tool_names,
+                &mut pending_commands,
                 &mut partial,
             )
             .await;
@@ -2494,17 +2804,55 @@ mod tests {
                     item_id,
                     kind,
                     phase,
+                    title,
                     detail,
                     ..
                 } => {
                     assert_eq!(item_id.as_deref(), Some("call_456"));
                     assert_eq!(kind, HarnessToolKind::Command);
                     assert_eq!(phase, super::HarnessToolPhase::End);
+                    assert_eq!(title.as_ref(), "Run command: px wrangler deploy");
                     assert_eq!(detail.as_ref(), "hello\nworld\n");
                 }
                 other => panic!("unexpected update: {other:?}"),
             }
             assert!(partial.is_empty());
+        });
+    }
+
+    #[test]
+    fn raw_session_completion_uses_pending_command_title() {
+        smol::block_on(async {
+            let (updates_tx, updates_rx) = channel::unbounded();
+            let mut pending_commands = std::collections::HashMap::from([(
+                "call_123".to_string(),
+                PendingRawSessionCommand {
+                    tool_name: "exec_command".to_string(),
+                    title: "Run command: px wrangler deploy".into(),
+                },
+            )]);
+
+            handle_parsed_command_event(
+                RawSessionCommandEvent::Completed {
+                    call_id: "call_123".to_string(),
+                    tool_name: None,
+                    title: SharedString::default(),
+                    output: "Uploaded worker".to_string(),
+                },
+                &HarnessThreadId("thread-1".into()),
+                &updates_tx,
+                &mut pending_commands,
+            )
+            .await;
+
+            match updates_rx.recv().await.unwrap() {
+                HarnessTurnUpdate::ToolEvent { title, detail, .. } => {
+                    assert_eq!(title.as_ref(), "Run command: px wrangler deploy");
+                    assert_eq!(detail.as_ref(), "Uploaded worker");
+                }
+                other => panic!("unexpected update: {other:?}"),
+            }
+            assert!(pending_commands.is_empty());
         });
     }
 
