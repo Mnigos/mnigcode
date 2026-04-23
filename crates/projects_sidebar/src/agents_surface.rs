@@ -3535,10 +3535,6 @@ impl AgentsSurface {
         let config = HarnessSessionConfig {
             thread_id: thread_id.clone(),
             provider_thread_id: thread.provider_thread_id.clone(),
-            replay_context: build_replay_context(
-                &thread.messages,
-                self.workspace.read(cx).path_style(cx),
-            ),
             cwd: thread.cwd.clone(),
             executor: cx.background_executor().clone(),
             model: self.selected_model.clone(),
@@ -3587,43 +3583,47 @@ impl AgentsSurface {
         let sanitized_text = sanitize_skill_mentions(&text, path_style);
         let combined_input = build_input_with_attachments(&sanitized_text, &attachments);
         let file_mentions = resolve_file_mention_spans(&self.workspace, &text, cx);
-        let thread = self.thread_mut(&thread_id)?;
+        let replay_context = {
+            let thread = self.thread_mut(&thread_id)?;
 
-        if thread.messages.is_empty() {
-            let attachment_fallback = attachments
-                .first()
-                .map(|first| attachment_display_name(first).to_string());
-            let title_source: &str = if !sanitized_text.is_empty() {
-                sanitized_text.as_str()
-            } else if let Some(fallback) = attachment_fallback.as_deref() {
-                fallback
-            } else {
-                "New thread"
-            };
-            thread.title = title_source
-                .lines()
-                .next()
-                .unwrap_or("New thread")
-                .chars()
-                .take(48)
-                .collect::<String>()
-                .into();
-        }
+            if thread.messages.is_empty() {
+                let attachment_fallback = attachments
+                    .first()
+                    .map(|first| attachment_display_name(first).to_string());
+                let title_source: &str = if !sanitized_text.is_empty() {
+                    sanitized_text.as_str()
+                } else if let Some(fallback) = attachment_fallback.as_deref() {
+                    fallback
+                } else {
+                    "New thread"
+                };
+                thread.title = title_source
+                    .lines()
+                    .next()
+                    .unwrap_or("New thread")
+                    .chars()
+                    .take(48)
+                    .collect::<String>()
+                    .into();
+            }
 
-        thread.messages.push(TranscriptMessage {
-            role: TranscriptRole::User,
-            text,
-            attachments,
-            file_mentions,
-            file_changes: Vec::new(),
-            started_at: None,
-            duration_ms: None,
-        });
-        thread.run_status = HarnessRunStatus::Connecting;
+            thread.messages.push(TranscriptMessage {
+                role: TranscriptRole::User,
+                text,
+                attachments,
+                file_mentions,
+                file_changes: Vec::new(),
+                started_at: None,
+                duration_ms: None,
+            });
+            thread.run_status = HarnessRunStatus::Connecting;
+            build_replay_context(&thread.messages, path_style)
+        };
         self.notify_thread_changed(cx);
 
         Some(HarnessTurnInput {
             input: combined_input,
+            replay_context,
             skill_mentions,
             model: self.selected_model.clone(),
             reasoning_effort: self.selected_reasoning_effort.clone(),
@@ -4635,12 +4635,13 @@ impl AgentsSurface {
         let max_tokens = max_token_count as f32;
         let used = tokens_used as f32;
         let ratio = (used / max_tokens).clamp(0.0, 1.0);
+        let severity_percentage = (ratio * 100.0).min(100.0) as u32;
         // Round up so that the moment the user spends any tokens, the bar
         // advertises at least 1%. Zero is only shown when the thread is empty.
         let percentage = (ratio * 100.0).ceil().min(100.0) as u32;
         let used_label = format_token_count(tokens_used);
         let max_label = format_token_count(max_token_count);
-        let bar_color = context_usage_indicator_color(percentage).color(cx);
+        let bar_color = context_usage_indicator_color(severity_percentage).color(cx);
         // Ensure the progress arc is visually perceptible even when usage is
         // still a tiny fraction of the window (new threads, first tokens).
         let display_value = (ratio.max(0.03) * max_tokens).min(max_tokens);

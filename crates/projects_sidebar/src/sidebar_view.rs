@@ -1,14 +1,13 @@
 use gpui::{
     AnyElement, AnyView, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    PathPromptOptions, Pixels, Render, SharedString, Subscription, Task, WeakEntity, Window, px,
-};
-use gpui::{
-    prelude::*,
+    PathPromptOptions, Pixels, Render, SharedString, Subscription, Task, WeakEntity, Window,
+    prelude::*, px,
 };
 use std::{collections::HashSet, path::PathBuf, time::Duration};
 use ui::{CommonAnimationExt, Tooltip, prelude::*};
 use workspace::{
-    MultiWorkspace, MultiWorkspaceEvent, OpenMode, ProjectGroup, Sidebar, SidebarEvent, SidebarSide,
+    MultiWorkspace, MultiWorkspaceEvent, OpenMode, ProjectGroup, Sidebar, SidebarEvent,
+    SidebarSide, ToggleWorkspaceMode,
 };
 
 use crate::agents_surface::{AgentsSurface, AgentsSurfaceEvent};
@@ -845,6 +844,9 @@ impl Render for ProjectsSidebar {
         v_flex()
             .key_context("ProjectsSidebar")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &ToggleWorkspaceMode, window, cx| {
+                this.toggle_workspace_mode(window, cx);
+            }))
             .size_full()
             .overflow_hidden()
             .border_r_1()

@@ -82,7 +82,6 @@ impl HarnessSandboxPolicy {
 pub struct HarnessSessionConfig {
     pub thread_id: HarnessThreadId,
     pub provider_thread_id: Option<String>,
-    pub replay_context: Option<String>,
     pub cwd: PathBuf,
     pub executor: BackgroundExecutor,
     pub model: String,
@@ -93,6 +92,7 @@ pub struct HarnessSessionConfig {
 #[derive(Clone, Debug)]
 pub struct HarnessTurnInput {
     pub input: String,
+    pub replay_context: Option<String>,
     pub skill_mentions: Vec<HarnessSkillMention>,
     pub model: String,
     pub reasoning_effort: String,
@@ -674,6 +674,7 @@ async fn run_codex_app_server_session_impl(
     )
     .await?;
 
+    let mut started_fallback_thread = false;
     let opened_thread = if let Some(provider_thread_id) = config.provider_thread_id.as_deref() {
         match resume_codex_thread(
             &mut reader,
@@ -687,6 +688,7 @@ async fn run_codex_app_server_session_impl(
         {
             Ok(opened_thread) => opened_thread,
             Err(error) if is_thread_not_found_error(&error) => {
+                started_fallback_thread = true;
                 start_codex_thread(
                     &mut reader,
                     &mut writer,
@@ -715,7 +717,7 @@ async fn run_codex_app_server_session_impl(
     };
     let mut provider_thread_id = opened_thread.provider_thread_id;
     let mut raw_session_path = opened_thread.raw_session_path;
-    let mut should_replay_context = config.provider_thread_id.is_none();
+    let mut should_replay_context = config.provider_thread_id.is_none() || started_fallback_thread;
 
     while let Ok(turn) = turns.recv().await {
         send_status(
@@ -733,7 +735,7 @@ async fn run_codex_app_server_session_impl(
             updates,
             &provider_thread_id,
             should_replay_context
-                .then_some(config.replay_context.as_deref())
+                .then_some(turn.replay_context.as_deref())
                 .flatten(),
             &turn,
         )
@@ -754,7 +756,7 @@ async fn run_codex_app_server_session_impl(
                 .await?;
                 provider_thread_id = opened_thread.provider_thread_id;
                 raw_session_path = opened_thread.raw_session_path;
-                should_replay_context = config.replay_context.is_some();
+                should_replay_context = turn.replay_context.is_some();
                 if let Err(error) = start_turn_without_killing(
                     &mut reader,
                     &mut writer,
@@ -763,7 +765,7 @@ async fn run_codex_app_server_session_impl(
                     updates,
                     &provider_thread_id,
                     should_replay_context
-                        .then_some(config.replay_context.as_deref())
+                        .then_some(turn.replay_context.as_deref())
                         .flatten(),
                     &turn,
                 )
