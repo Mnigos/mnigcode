@@ -15,7 +15,9 @@ use markdown::{Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
 use menu::Confirm;
 use project::{
     Candidates, Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource,
-    PathMatchCandidateSet, lsp_store::CompletionDocumentation,
+    PathMatchCandidateSet,
+    git_store::{GitStoreEvent, RepositoryEvent},
+    lsp_store::CompletionDocumentation,
 };
 use smol::channel;
 use std::{
@@ -61,7 +63,7 @@ const COMPOSER_WIDTH: Pixels = px(720.0);
 
 fn model_context_window(model: &str) -> usize {
     match model {
-        "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.3-codex" => 256_000,
+        "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.3-codex" => 256_000,
         "gpt-5.2" => 128_000,
         _ => 256_000,
     }
@@ -96,6 +98,7 @@ fn permission_options() -> [(HarnessSandboxPolicy, &'static str, IconName); 2] {
 }
 
 const AVAILABLE_MODELS: &[(&str, &str)] = &[
+    ("gpt-5.5", "GPT-5.5"),
     ("gpt-5.4", "GPT-5.4"),
     ("gpt-5.4-mini", "GPT-5.4-Mini"),
     ("gpt-5.3-codex", "GPT-5.3-Codex"),
@@ -104,8 +107,12 @@ const AVAILABLE_MODELS: &[(&str, &str)] = &[
 
 const DEFAULT_MODEL: &str = "gpt-5.4";
 
-const REASONING_EFFORTS: &[(&str, &str)] =
-    &[("low", "Low"), ("medium", "Medium"), ("high", "High")];
+const REASONING_EFFORTS: &[(&str, &str)] = &[
+    ("low", "Low"),
+    ("medium", "Medium"),
+    ("high", "High"),
+    ("xhigh", "Extra High"),
+];
 
 const DEFAULT_REASONING_EFFORT: &str = "high";
 
@@ -996,7 +1003,14 @@ fn resolve_file_mention_spans(
         .collect()
 }
 
-fn build_replay_context(messages: &[TranscriptMessage], path_style: util::paths::PathStyle) -> Option<String> {
+fn is_provider_system_message(_message: &TranscriptMessage) -> bool {
+    false
+}
+
+fn build_replay_context(
+    messages: &[TranscriptMessage],
+    path_style: util::paths::PathStyle,
+) -> Option<String> {
     let pending_user_index = messages
         .iter()
         .rposition(|message| matches!(message.role, TranscriptRole::User))
@@ -1018,7 +1032,7 @@ fn build_replay_context(messages: &[TranscriptMessage], path_style: util::paths:
                 }
             }
             TranscriptRole::System => {
-                if !message.text.trim().is_empty() {
+                if is_provider_system_message(message) && !message.text.trim().is_empty() {
                     sections.push(format!("System:\n{}", message.text));
                 }
             }
@@ -1473,6 +1487,10 @@ fn total_added_lines(file_changes: &[HarnessFileChange]) -> usize {
 
 fn total_removed_lines(file_changes: &[HarnessFileChange]) -> usize {
     file_changes.iter().map(|change| change.removed_lines).sum()
+}
+
+fn file_change_has_stats(change: &HarnessFileChange) -> bool {
+    change.added_lines > 0 || change.removed_lines > 0 || change.unified_diff.is_some()
 }
 
 fn normalized_file_change_path(path: &str) -> &Path {
@@ -2584,16 +2602,18 @@ impl TranscriptView {
                         .truncate(),
                 )
                 .child(div().flex_1())
-                .child(
-                    ui::DiffStat::new(
-                        SharedString::from(format!(
-                            "file-change-stat-{message_index}-{change_index}"
-                        )),
-                        change.added_lines,
-                        change.removed_lines,
+                .when(file_change_has_stats(change), |this| {
+                    this.child(
+                        ui::DiffStat::new(
+                            SharedString::from(format!(
+                                "file-change-stat-{message_index}-{change_index}"
+                            )),
+                            change.added_lines,
+                            change.removed_lines,
+                        )
+                        .label_size(LabelSize::Small),
                     )
-                    .label_size(LabelSize::Small),
-                );
+                });
 
             let mut item = v_flex().w_full().child(row);
             if expanded {
@@ -3045,6 +3065,7 @@ pub struct AgentsSurface {
     skills_refresh_task: Option<Task<()>>,
     codex_sessions: HashMap<HarnessThreadId, CodexSessionHandle>,
     streaming_notify_task: Option<Task<()>>,
+    git_store_subscription: Option<Subscription>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -3090,9 +3111,12 @@ impl AgentsSurface {
         let active_workspace_subscription = cx.subscribe_in(
             &multi_workspace,
             window,
-            |this, multi_workspace, event: &MultiWorkspaceEvent, _window, cx| {
+            |this, multi_workspace, event: &MultiWorkspaceEvent, window, cx| {
                 if matches!(event, MultiWorkspaceEvent::ActiveWorkspaceChanged) {
                     this.workspace = multi_workspace.read(cx).workspace().clone();
+                    let workspace = this.workspace.clone();
+                    this.git_store_subscription =
+                        Some(Self::subscribe_to_git_store(&workspace, window, cx));
                     this.sync_transcript_view(cx);
                     this.refresh_available_skills(cx);
                     cx.notify();
@@ -3154,15 +3178,44 @@ impl AgentsSurface {
             skills_refresh_task: None,
             codex_sessions: HashMap::new(),
             streaming_notify_task: None,
+            git_store_subscription: None,
             _subscriptions: vec![
                 active_workspace_subscription,
                 transcript_subscription,
                 composer_subscription,
             ],
         };
+        this.git_store_subscription = Some(Self::subscribe_to_git_store(
+            &this.workspace,
+            window,
+            cx,
+        ));
         this.sync_transcript_view(cx);
         this.refresh_available_skills(cx);
         this
+    }
+
+    fn subscribe_to_git_store(
+        workspace: &Entity<workspace::Workspace>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        let git_store = workspace.read(cx).project().read(cx).git_store().clone();
+        cx.subscribe_in(
+            &git_store,
+            window,
+            |_, _, event: &GitStoreEvent, _window, cx| match event {
+                GitStoreEvent::ActiveRepositoryChanged(_)
+                | GitStoreEvent::RepositoryAdded
+                | GitStoreEvent::RepositoryRemoved(_) => cx.notify(),
+                GitStoreEvent::RepositoryUpdated(
+                    _,
+                    RepositoryEvent::HeadChanged | RepositoryEvent::BranchListChanged,
+                    true,
+                ) => cx.notify(),
+                _ => {}
+            },
+        )
     }
 
     /// Coalesce rapid streaming updates into at most one re-render per
@@ -4635,13 +4688,12 @@ impl AgentsSurface {
         let max_tokens = max_token_count as f32;
         let used = tokens_used as f32;
         let ratio = (used / max_tokens).clamp(0.0, 1.0);
-        let severity_percentage = (ratio * 100.0).min(100.0) as u32;
         // Round up so that the moment the user spends any tokens, the bar
         // advertises at least 1%. Zero is only shown when the thread is empty.
         let percentage = (ratio * 100.0).ceil().min(100.0) as u32;
         let used_label = format_token_count(tokens_used);
         let max_label = format_token_count(max_token_count);
-        let bar_color = context_usage_indicator_color(severity_percentage).color(cx);
+        let bar_color = context_usage_indicator_color(percentage).color(cx);
         // Ensure the progress arc is visually perceptible even when usage is
         // still a tiny fraction of the window (new threads, first tokens).
         let display_value = (ratio.max(0.03) * max_tokens).min(max_tokens);
@@ -4813,10 +4865,10 @@ mod tests {
         ComposerQuery, FileMentionQuery, FileMentionSpan, SkillMentionQuery, SkillMentionSpan,
         apply_token_usage, build_replay_context, complete_running_commands,
         context_usage_indicator_color,
-        format_file_mention, mask_skill_mentions, merge_file_changes,
-        parse_file_mention_spans, parse_file_mentions, parse_skill_mention_spans,
-        sanitize_skill_mentions, should_show_role_header, summarize_file_changes,
-        tool_status_after_phase,
+        file_change_has_stats, format_file_mention, is_provider_system_message,
+        mask_skill_mentions, merge_file_changes, parse_file_mention_spans, parse_file_mentions,
+        parse_skill_mention_spans, sanitize_skill_mentions, should_show_role_header,
+        summarize_file_changes, tool_status_after_phase,
     };
     use crate::{
         harness::{
@@ -4869,6 +4921,22 @@ mod tests {
     }
 
     #[test]
+    fn file_change_without_stats_or_diff_has_no_display_stats() {
+        assert!(!file_change_has_stats(&HarnessFileChange {
+            path: "src/main.rs".into(),
+            added_lines: 0,
+            removed_lines: 0,
+            unified_diff: None,
+        }));
+        assert!(file_change_has_stats(&HarnessFileChange {
+            path: "src/main.rs".into(),
+            added_lines: 0,
+            removed_lines: 0,
+            unified_diff: Some("@@ -1 +1 @@\n unchanged".to_string()),
+        }));
+    }
+
+    #[test]
     fn builds_replay_context_from_prior_local_messages() {
         let mut first_user = TranscriptMessage::new(TranscriptRole::User, "hey".to_string());
         first_user.attachments.push("/tmp/note.txt".into());
@@ -4883,6 +4951,32 @@ mod tests {
             build_replay_context(&messages, PathStyle::local()).as_deref(),
             Some(
                 "Prior local thread context (replayed because the provider thread had to be restored):\n\nUser:\nhey\n\nAttached files:\n- /tmp/note.txt\n\nAssistant:\nhello\n\nContinue from that restored context."
+            )
+        );
+    }
+
+    #[test]
+    fn replay_context_skips_local_system_notices() {
+        let messages = vec![
+            TranscriptMessage::new(TranscriptRole::User, "hey".to_string()),
+            TranscriptMessage::new(
+                TranscriptRole::System,
+                "Agent is already working on this thread. Please wait for this turn to finish."
+                    .to_string(),
+            ),
+            TranscriptMessage::new(TranscriptRole::Assistant, "hello".to_string()),
+            TranscriptMessage::new(
+                TranscriptRole::System,
+                "Agent session closed unexpectedly. Please try again.".to_string(),
+            ),
+            TranscriptMessage::new(TranscriptRole::User, "continue".to_string()),
+        ];
+
+        assert!(!is_provider_system_message(&messages[1]));
+        assert_eq!(
+            build_replay_context(&messages, PathStyle::local()).as_deref(),
+            Some(
+                "Prior local thread context (replayed because the provider thread had to be restored):\n\nUser:\nhey\n\nAssistant:\nhello\n\nContinue from that restored context."
             )
         );
     }

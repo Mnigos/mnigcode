@@ -1396,7 +1396,7 @@ fn file_change_from_value(path_hint: Option<&str>, value: &Value) -> Option<Harn
         .map(str::to_string)
         .or_else(|| lookup_string(&["path", "filePath", "file", "relativePath", "absolutePath"]))?;
     let unified_diff =
-        lookup_string(&["unified_diff", "unifiedDiff", "diff", "patch"]).or_else(|| {
+        lookup_string(&["unified_diff", "unifiedDiff", "diff", "patch", "changes"]).or_else(|| {
             let old_text = lookup_string(&["old_text", "oldText", "before"]);
             let new_text = lookup_string(&["new_text", "newText", "after"]);
             match (old_text, new_text) {
@@ -1417,6 +1417,7 @@ fn file_change_from_value(path_hint: Option<&str>, value: &Value) -> Option<Harn
         "additions",
         "linesAdded",
         "insertions",
+        "added",
     ])
     .unwrap_or(diff_added);
     let removed_lines = lookup_usize(&[
@@ -1425,6 +1426,8 @@ fn file_change_from_value(path_hint: Option<&str>, value: &Value) -> Option<Harn
         "deletions",
         "linesRemoved",
         "deletedLines",
+        "removed",
+        "deleted",
     ])
     .unwrap_or(diff_removed);
 
@@ -2520,6 +2523,45 @@ mod tests {
         assert_eq!(event.file_changes[0].path.as_ref(), "src/main.rs");
         assert_eq!(event.file_changes[0].added_lines, 1);
         assert_eq!(event.file_changes[0].removed_lines, 1);
+    }
+
+    #[test]
+    fn extracts_file_change_stats_from_alternate_fields() {
+        let params = json!({
+            "item": {
+                "id": "edit-1",
+                "type": "fileChange",
+                "changes": {
+                    "src/main.rs": {
+                        "type": "update",
+                        "changes": "@@ -1,2 +1,3 @@\n fn main() {\n-    old();\n+    new();\n+    more();\n }\n"
+                    },
+                    "src/lib.rs": {
+                        "type": "update",
+                        "added": 4,
+                        "deleted": 2
+                    }
+                }
+            }
+        });
+
+        let event = parse_tool_event("item/completed", Some(&params)).unwrap();
+
+        assert_eq!(event.file_changes.len(), 2);
+        let main = event
+            .file_changes
+            .iter()
+            .find(|change| change.path.as_ref() == "src/main.rs")
+            .unwrap();
+        assert_eq!(main.added_lines, 2);
+        assert_eq!(main.removed_lines, 1);
+        let lib = event
+            .file_changes
+            .iter()
+            .find(|change| change.path.as_ref() == "src/lib.rs")
+            .unwrap();
+        assert_eq!(lib.added_lines, 4);
+        assert_eq!(lib.removed_lines, 2);
     }
 
     #[test]
