@@ -1,11 +1,13 @@
 use gpui::{
     AnyElement, AnyView, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    PathPromptOptions, Pixels, Render, SharedString, Subscription, Task, WeakEntity, Window, px,
+    PathPromptOptions, Pixels, Render, SharedString, Subscription, Task, WeakEntity, Window,
+    prelude::*, px,
 };
 use std::{collections::HashSet, path::PathBuf, time::Duration};
 use ui::{CommonAnimationExt, Tooltip, prelude::*};
 use workspace::{
-    MultiWorkspace, MultiWorkspaceEvent, OpenMode, ProjectGroup, Sidebar, SidebarEvent, SidebarSide,
+    MultiWorkspace, MultiWorkspaceEvent, OpenMode, ProjectGroup, Sidebar, SidebarEvent,
+    SidebarSide, ToggleWorkspaceMode,
 };
 
 use crate::agents_surface::{AgentsSurface, AgentsSurfaceEvent};
@@ -842,6 +844,9 @@ impl Render for ProjectsSidebar {
         v_flex()
             .key_context("ProjectsSidebar")
             .track_focus(&self.focus_handle)
+            .on_action(cx.listener(|this, _: &ToggleWorkspaceMode, window, cx| {
+                this.toggle_workspace_mode(window, cx);
+            }))
             .size_full()
             .overflow_hidden()
             .border_r_1()
@@ -862,10 +867,12 @@ impl Render for ProjectsSidebar {
             )
             .child(self.render_add_project_row(cx))
             .child(
-                v_flex()
-                    .gap_2()
-                    .overflow_hidden()
-                    .children(project_elements),
+                div()
+                    .id("projects-sidebar-scroll-container")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(v_flex().gap_2().children(project_elements)),
             )
     }
 }
